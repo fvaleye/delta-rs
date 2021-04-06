@@ -237,7 +237,7 @@ def pyarrow_datatype_from_dict(json_dict: Dict) -> pyarrow.DataType:
             elif type_info["unit"] == "SECOND":
                 unit = "s"
         else:
-            unit = "ns"
+            unit = "us"
         return pyarrow.type_for_alias(f"{type_class}[{unit}]")
     elif type_class.startswith("decimal"):
         type_info = json_dict["type"]

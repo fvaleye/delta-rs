@@ -174,7 +174,7 @@ def test_schema_pyarrow_types():
         }
     )
     assert pyarrow_field.name == field_name
-    assert pyarrow_field.type == pyarrow.timestamp("ns")
+    assert pyarrow_field.type == pyarrow.timestamp("us")
     assert dict(pyarrow_field.metadata) == metadata
     assert pyarrow_field.nullable is False
 
