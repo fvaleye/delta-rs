@@ -206,12 +206,12 @@ def test_read_multiple_tables_from_s3(s3cred):
 @pytest.mark.s3
 @pytest.mark.integration
 @pytest.mark.timeout(timeout=10, method="thread")
-def test_read_multiple_tables_from_s3_multi_threaded(s3cred):
+def test_read_multiple_tables_from_s3_multi_threaded(s3cred) -> None:
     thread_count = 10
     b = Barrier(thread_count, timeout=5)
 
     # make sure it works within multiple threads as well
-    def read_table():
+    def read_table() -> None:
         b.wait()
         t = DeltaTable("s3://deltars/simple")
         assert t.files() == [
