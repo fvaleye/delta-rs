@@ -18,7 +18,7 @@ format: setup ## Format the code
 	isort .
 
 .PHONY: check-rust
-check-rust: develop ## Run check on Rust
+check-rust: ## Run check on Rust
 	cargo clippy
 	cargo fmt -- --check
 
