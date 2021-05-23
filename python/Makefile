@@ -15,7 +15,7 @@ develop: setup ## Install Python binding of delta-rs
 install: setup ## Install to publish Python binding of delta-rs
 	maturin build --manylinux off
 	ls -lh ../target/wheels
-	pip install "../target/wheels/deltalake-$(VERSION).tar.gz[devel,pandas]"
+	pip install $(shell printf ../target/wheels/deltalake-$(VERSION)-cp36-abi3-*.whl)'[devel,pandas]'
 
 .PHONY: format
 format: develop ## Format the code
