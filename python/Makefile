@@ -11,14 +11,8 @@ setup: ## Setup the requirements
 develop: setup ## Install Python binding of delta-rs
 	maturin develop
 
-.PHONY: install
-install: setup ## Install to publish Python binding of delta-rs
-	maturin build --manylinux off
-	ls -lh ../target/wheels
-	pip install $(shell printf ../target/wheels/deltalake-$(VERSION)-cp36-abi3-*.whl)'[devel,pandas]'
-
 .PHONY: format
-format: develop ## Format the code
+format: setup ## Format the code
 	cargo fmt
 	black .
 	isort .
@@ -29,13 +23,13 @@ check-rust: develop ## Run check on Rust
 	cargo fmt -- --check
 
 .PHONY: check-python
-check-python: develop ## Run check on Python
+check-python: ## Run check on Python
 	isort --check-only .
 	black --check .
 	mypy --exclude "$(VENV)|docs|tests" .
 
 .PHONY: unit-test
-unit-test: install ## Run unit tests
+unit-test: ## Run unit tests
 	py.test --cov tests -m 'not integration'
 
 .PHONY: build-documentation

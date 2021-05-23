@@ -102,7 +102,10 @@ jobs:
         override: true
 
     - name: Build and install deltalake
-      run: make install
+      run: |
+        make setup
+        maturin build --manylinux off
+        pip install $(printf ../target/wheels/deltalake-*-cp36-abi3-*.whl)'[devel,pandas]'
 
     - name: Build Sphinx documentation
       run: |
