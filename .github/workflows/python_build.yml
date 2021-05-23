@@ -19,14 +19,16 @@ jobs:
       uses: actions/setup-python@v2
       with:
         python-version: 3.6
+    - name: Build and Install deltalake
+      run: make install
     - name: Check Python
       run: make check-python
     - name: Install minimal stable with clippy and rustfmt
-    uses: actions-rs/toolchain@v1
-    with:
-      profile: default
-      toolchain: stable
-      override: true
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: default
+        toolchain: stable
+        override: true
     - name: Check Rust
       run: make check-rust
 
@@ -53,11 +55,8 @@ jobs:
     - name: Enable manylinux Python targets
       run: echo "/opt/python/cp36-cp36m/bin" >> $GITHUB_PATH
 
-    - name: Build and install deltalake
-      run: make install
-
     - name: Run tests
-      run: make unit-tests
+      run: make unit-test
 
     # - name: Run Integration tests
     #   run: |

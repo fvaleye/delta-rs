@@ -3,40 +3,39 @@
 VENV := venv
 VERSION := $(shell cargo pkgid | cut -d\# -f2 | cut -d: -f2)
 
-.PHONY: venv
-venv: ## Setup the virtual env
-	source $(VENV)/bin/activate;
-
 .PHONY: setup
-setup: venv ## Setup the requirements
+setup: ## Setup the requirements
 	pip install maturin==0.10.6
 
+.PHONY: develop
+develop: setup ## Install Python binding of delta-rs
+	maturin develop
+
 .PHONY: install
-install: setup ## Install Python binding of delta-rs
+install: setup ## Install to publish Python binding of delta-rs
 	maturin build --manylinux off
 	ls -lh ../target/wheels
-	pip install $(shell printf ../target/wheels/deltalake-$(VERSION)-cp36-abi3-*.whl)'[devel,pandas]'
+	pip install "../target/wheels/deltalake-$(VERSION).tar.gz[devel,pandas]"
 
 .PHONY: format
-format: ## Format the code
+format: develop ## Format the code
 	cargo fmt
-	black --exclude=$(VENV) .
-	isort --profile black .
+	black .
+	isort .
 
 .PHONY: check-rust
-check-rust: ## Run check on Rust
+check-rust: develop ## Run check on Rust
 	cargo clippy
 	cargo fmt -- --check
 
 .PHONY: check-python
-check-python: ## Run check on Python
-	isort --profile black --check-only .
-	black --exclude=$(VENV) . --check
+check-python: develop ## Run check on Python
+	isort --check-only .
+	black --check .
 	mypy --exclude "$(VENV)|docs|tests" .
 
 .PHONY: unit-test
-unit-test: venv ## Run unit tests
-	source venv/bin/activate;
+unit-test: install ## Run unit tests
 	py.test --cov tests -m 'not integration'
 
 .PHONY: build-documentation
@@ -44,7 +43,7 @@ documentation: ## Build documentation with Sphinx
 	sphinx-build -Wn -b html -d ./docs/build/doctrees ./docs/source ./docs/build/html
 
 .PHONY: publish
-publish: setup ## Publish Python version
+publish: install ## Publish Python version
 	maturin publish -b pyo3 --target $(TARGET) --no-sdist
 
 .PHONY: clean
