@@ -902,7 +902,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-proto",
- "dotenv",
+ "dotenvy",
  "dynamodb_lock",
  "errno",
  "fs_extra",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "deltalake-python"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -1021,10 +1021,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
-name = "dotenv"
-version = "0.15.0"
+name = "dotenvy"
+version = "0.15.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
+checksum = "03d8c417d7a8cb362e0c37e5d815f5eb7c37f79ff93707329d5a194e42e54ca0"
 
 [[package]]
 name = "dynamodb_lock"
@@ -2204,9 +2204,9 @@ checksum = "1131c54b167dd4e4799ce762e1ab01549ebb94d5bdd13e6ec1b467491c378e1f"
 
 [[package]]
 name = "parquet2"
-version = "0.16.3"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7752b1a7d61b278f36820ba05557a2a8bfcb17f3559254577ef447beda0c4975"
+checksum = "e0bbada33c3674484db647d889a581ab1105cafb871ba77be785af2cc44a8747"
 dependencies = [
  "brotli",
  "flate2",
