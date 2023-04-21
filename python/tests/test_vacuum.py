@@ -4,12 +4,13 @@ import pathlib
 import pyarrow as pa
 import pytest
 
-from deltalake import DeltaTable, write_deltalake
+from deltalake import DeltaTable, DeltaTableAsync, write_deltalake
 
 
-def test_vacuum_dry_run_simple_table():
+@pytest.mark.parametrize("table", [DeltaTable, DeltaTableAsync])
+def test_vacuum_dry_run_simple_table(table):
     table_path = "../rust/tests/data/delta-0.2.0"
-    dt = DeltaTable(table_path)
+    dt = table(table_path)
     retention_periods = 169
     tombstones = dt.vacuum(retention_periods)
     tombstones.sort()

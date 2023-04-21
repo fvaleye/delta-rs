@@ -3,9 +3,8 @@ import urllib
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from pyarrow.fs import S3FileSystem
 
-from deltalake import DeltaTable, PyDeltaTableError
+from deltalake import DeltaTable, DeltaTableAsync, PyDeltaTableError
 from deltalake.fs import DeltaStorageHandler
 from deltalake.writer import write_deltalake
 
@@ -13,10 +12,11 @@ from deltalake.writer import write_deltalake
 @pytest.mark.s3
 @pytest.mark.integration
 @pytest.mark.timeout(timeout=5, method="thread")
-def test_read_files(s3_localstack):
+@pytest.mark.parametrize("table", [DeltaTable, DeltaTableAsync])
+def test_read_files(s3_localstack, table):
     table_path = "s3://deltars/simple"
     handler = DeltaStorageHandler(table_path)
-    dt = DeltaTable(table_path)
+    dt = table(table_path)
     files = dt.file_uris()
     assert len(files) > 0
     for file in files:
@@ -55,9 +55,10 @@ def test_s3_authenticated_read_write(s3_localstack_creds):
 @pytest.mark.s3
 @pytest.mark.integration
 @pytest.mark.timeout(timeout=5, method="thread")
-def test_read_simple_table_from_remote(s3_localstack):
+@pytest.mark.parametrize("table", [DeltaTable, DeltaTableAsync])
+def test_read_simple_table_from_remote(s3_localstack, table):
     table_path = "s3://deltars/simple"
-    dt = DeltaTable(table_path)
+    dt = table(table_path)
     assert dt.to_pyarrow_table().equals(pa.table({"id": [5, 7, 9]}))
 
 
@@ -87,7 +88,6 @@ def test_roundtrip_s3_env(s3_localstack, sample_data: pa.Table, monkeypatch):
 
     table = dt.to_pyarrow_table()
     assert table == sample_data
-
 
 @pytest.mark.s3
 @pytest.mark.integration

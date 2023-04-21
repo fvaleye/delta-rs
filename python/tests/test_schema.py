@@ -1,5 +1,3 @@
-from array import array
-
 import pyarrow
 import pytest
 

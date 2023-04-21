@@ -31,10 +31,11 @@ devel = [
     "pytest",
     "pytest-mock",
     "pytest-cov",
+    "pytest-asyncio",
     "pytest-timeout",
     "sphinx<=4.5",
     "sphinx-rtd-theme",
-    "toml"
+    "toml",
 ]
 pyspark = [
     "pyspark",

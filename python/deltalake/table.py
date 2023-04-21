@@ -1,7 +1,17 @@
 import json
 import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import pyarrow
 import pyarrow.fs as pa_fs
@@ -10,7 +20,7 @@ from pyarrow.dataset import FileSystemDataset, ParquetFileFormat, ParquetReadOpt
 if TYPE_CHECKING:
     import pandas
 
-from ._internal import PyDeltaTableError, RawDeltaTable
+from ._internal import PyDeltaTableError, RawAsyncDeltaTable, RawDeltaTable
 from .data_catalog import DataCatalog
 from .fs import DeltaStorageHandler
 from .schema import Schema
@@ -389,3 +399,80 @@ class DeltaTable:
         newer versions.
         """
         self._table.update_incremental()
+
+
+@dataclass(init=False)
+class DeltaTableAsync(DeltaTable):
+    """Create a DeltaTableAsync instance."""
+
+    def __init__(
+        self,
+        table_uri: str,
+        version: Optional[int] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        without_files: bool = False,
+    ):
+        """
+        Create the Delta Table from a path with an optional version.
+        Multiple StorageBackends are currently supported: AWS S3, Azure Data Lake Storage Gen2, Google Cloud Storage (GCS) and local URI.
+        Depending on the storage backend used, you could provide options values using the ``storage_options`` parameter.
+
+        :param table_uri: the path of the DeltaTable
+        :param version: version of the DeltaTable
+        :param storage_options: a dictionary of the options to use for the storage backend
+        :param without_files: If True, will load table without tracking files.
+                              Some append-only applications might have no need of tracking any files. So, the
+                              DeltaTable will be loaded with a significant memory reduction.
+        """
+
+        super().__init__(table_uri, version, storage_options, without_files)
+        self._table = RawAsyncDeltaTable(
+            table_uri,
+            version=version,
+            storage_options=storage_options,
+            without_files=without_files,
+        )
+
+    async def load_version(self, version: int) -> None:
+        """
+        Load a DeltaTable with a specified version.
+
+        :param version: the identifier of the version of the DeltaTable to load
+        """
+        await self._table.load_version(version)
+
+    async def load_with_datetime(self, datetime_string: str) -> None:
+        """
+        Time travel Delta table to the latest version that's created at or before provided `datetime_string` argument.
+        The `datetime_string` argument should be an RFC 3339 and ISO 8601 date and time string.
+
+        Examples:
+        `2018-01-26T18:30:09Z`
+        `2018-12-19T16:39:57-08:00`
+        `2018-01-26T18:30:09.453+00:00`
+
+        :param datetime_string: the identifier of the datetime point of the DeltaTable to load
+        """
+        await self._table.load_with_datetime(datetime_string)
+
+    async def history(
+        self, limit: Optional[int] = None
+    ) -> Awaitable[List[Dict[str, Any]]]:
+        """
+        Run the history command on the DeltaTable.
+        The operations are returned in reverse chronological order.
+
+        :param limit: the commit info limit to return
+        :return: list of the commit infos registered in the transaction log
+        """
+        return [
+            json.loads(commit_info_raw)
+            for commit_info_raw in await self._table.history(limit)
+        ]
+
+    async def update_incremental(self) -> Awaitable[None]:
+        """
+        Updates the DeltaTable to the latest version by incrementally applying
+        newer versions.
+        """
+        await self._table.update_incremental()

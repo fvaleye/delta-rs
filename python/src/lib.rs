@@ -1,5 +1,6 @@
 #![deny(warnings)]
 
+mod asyncio;
 mod filesystem;
 mod schema;
 mod utils;
@@ -75,7 +76,7 @@ fn rt() -> PyResult<tokio::runtime::Runtime> {
 }
 
 #[derive(FromPyObject)]
-enum PartitionFilterValue<'a> {
+pub enum PartitionFilterValue<'a> {
     Single(&'a str),
     Multiple(Vec<&'a str>),
 }
@@ -86,7 +87,7 @@ struct RawDeltaTable {
 }
 
 #[pyclass]
-struct RawDeltaTableMetaData {
+pub struct RawDeltaTableMetaData {
     #[pyo3(get)]
     id: String,
     #[pyo3(get)]
@@ -646,7 +647,12 @@ fn _internal(py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_function(pyo3::wrap_pyfunction!(rust_core_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(write_new_deltalake, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        asyncio::write_new_deltalake_async,
+        m
+    )?)?;
     m.add_class::<RawDeltaTable>()?;
+    m.add_class::<asyncio::RawAsyncDeltaTable>()?;
     m.add_class::<RawDeltaTableMetaData>()?;
     m.add_class::<PyDeltaDataChecker>()?;
     m.add("PyDeltaTableError", py.get_type::<PyDeltaTableError>())?;

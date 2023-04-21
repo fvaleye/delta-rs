@@ -12,6 +12,7 @@ import pyarrow.fs as fs
 from deltalake.writer import AddAction
 
 RawDeltaTable: Any
+RawAsyncDeltaTable: Any
 rust_core_version: Callable[[], str]
 
 class PyDeltaTableError(BaseException): ...
