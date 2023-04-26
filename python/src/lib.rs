@@ -6,24 +6,26 @@ mod schema;
 mod utils;
 
 use arrow::pyarrow::PyArrowType;
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use deltalake::action::{
     self, Action, ColumnCountStat, ColumnValueStat, DeltaOperation, SaveMode, Stats,
 };
+use deltalake::arrow::compute::concat_batches;
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::arrow::{self, datatypes::Schema as ArrowSchema};
 use deltalake::builder::DeltaTableBuilder;
+use deltalake::checkpoints::create_checkpoint;
+use deltalake::datafusion::prelude::SessionContext;
 use deltalake::delta_datafusion::DeltaDataChecker;
+use deltalake::operations::transaction::commit;
+use deltalake::operations::vacuum::VacuumBuilder;
 use deltalake::partitions::PartitionFilter;
-use deltalake::DeltaDataTypeLong;
-use deltalake::DeltaDataTypeTimestamp;
-use deltalake::DeltaTableMetaData;
-use deltalake::DeltaTransactionOptions;
-use deltalake::{Invariant, Schema};
+use deltalake::{DeltaDataTypeLong, DeltaDataTypeTimestamp, DeltaTableMetaData, Invariant, Schema};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyFrozenSet;
 use pyo3::types::PyType;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -32,6 +34,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use crate::filesystem::FsConfig;
 use crate::schema::schema_to_pyobject;
 
 create_exception!(deltalake, PyDeltaTableError, PyException);
@@ -41,15 +44,15 @@ impl PyDeltaTableError {
         PyDeltaTableError::new_err(err.to_string())
     }
 
+    fn from_datafusion(err: deltalake::datafusion::error::DataFusionError) -> pyo3::PyErr {
+        PyDeltaTableError::new_err(err.to_string())
+    }
+
     fn from_data_catalog(err: deltalake::DataCatalogError) -> pyo3::PyErr {
         PyDeltaTableError::new_err(err.to_string())
     }
 
     fn from_raw(err: deltalake::DeltaTableError) -> pyo3::PyErr {
-        PyDeltaTableError::new_err(err.to_string())
-    }
-
-    fn from_vacuum_error(err: deltalake::vacuum::VacuumError) -> pyo3::PyErr {
         PyDeltaTableError::new_err(err.to_string())
     }
 
@@ -66,7 +69,11 @@ impl PyDeltaTableError {
     }
 
     fn from_chrono(err: chrono::ParseError) -> pyo3::PyErr {
-        PyDeltaTableError::new_err(format!("Parse date and time string failed: {}", err))
+        PyDeltaTableError::new_err(format!("Parse date and time string failed: {err}"))
+    }
+
+    fn from_checkpoint(err: deltalake::checkpoints::CheckpointError) -> pyo3::PyErr {
+        PyDeltaTableError::new_err(err.to_string())
     }
 }
 
@@ -84,6 +91,8 @@ pub enum PartitionFilterValue<'a> {
 #[pyclass]
 struct RawDeltaTable {
     _table: deltalake::DeltaTable,
+    // storing the config additionally on the table helps us make pickling work.
+    _config: FsConfig,
 }
 
 #[pyclass]
@@ -105,6 +114,7 @@ pub struct RawDeltaTableMetaData {
 #[pymethods]
 impl RawDeltaTable {
     #[new]
+    #[pyo3(signature = (table_uri, version = None, storage_options = None, without_files = false))]
     fn new(
         table_uri: &str,
         version: Option<deltalake::DeltaDataTypeLong>,
@@ -112,6 +122,7 @@ impl RawDeltaTable {
         without_files: bool,
     ) -> PyResult<Self> {
         let mut builder = deltalake::DeltaTableBuilder::from_uri(table_uri);
+        let options = storage_options.clone().unwrap_or_default();
         if let Some(storage_options) = storage_options {
             builder = builder.with_storage_options(storage_options)
         }
@@ -126,7 +137,13 @@ impl RawDeltaTable {
         let table = rt()?
             .block_on(builder.load())
             .map_err(PyDeltaTableError::from_raw)?;
-        Ok(RawDeltaTable { _table: table })
+        Ok(RawDeltaTable {
+            _table: table,
+            _config: FsConfig {
+                root_url: table_uri.into(),
+                options,
+            },
+        })
     }
 
     #[classmethod]
@@ -224,16 +241,43 @@ impl RawDeltaTable {
         }
     }
 
-    pub fn files(&self) -> PyResult<Vec<String>> {
-        Ok(self
-            ._table
-            .get_files_iter()
-            .map(|f| f.to_string())
-            .collect())
+    pub fn files(
+        &self,
+        partition_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
+    ) -> PyResult<Vec<String>> {
+        if let Some(filters) = partition_filters {
+            let filters =
+                convert_partition_filters(filters).map_err(PyDeltaTableError::from_raw)?;
+            Ok(self
+                ._table
+                .get_files_by_partitions(&filters)
+                .map_err(PyDeltaTableError::from_raw)?
+                .into_iter()
+                .map(|p| p.to_string())
+                .collect())
+        } else {
+            Ok(self
+                ._table
+                .get_files_iter()
+                .map(|f| f.to_string())
+                .collect())
+        }
     }
 
-    pub fn file_uris(&self) -> PyResult<Vec<String>> {
-        Ok(self._table.get_file_uris().collect())
+    pub fn file_uris(
+        &self,
+        partition_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
+    ) -> PyResult<Vec<String>> {
+        if let Some(filters) = partition_filters {
+            let filters =
+                convert_partition_filters(filters).map_err(PyDeltaTableError::from_raw)?;
+            Ok(self
+                ._table
+                .get_file_uris_by_partitions(&filters)
+                .map_err(PyDeltaTableError::from_raw)?)
+        } else {
+            Ok(self._table.get_file_uris().collect())
+        }
     }
 
     #[getter]
@@ -245,19 +289,26 @@ impl RawDeltaTable {
         schema_to_pyobject(schema, py)
     }
 
-    /// Run the Vacuum command on the Delta Table: list and delete files no longer referenced by the Delta table and are older than the retention threshold.
+    /// Run the Vacuum command on the Delta Table: list and delete files no longer referenced
+    /// by the Delta table and are older than the retention threshold.
+    #[pyo3(signature = (dry_run, retention_hours = None, enforce_retention_duration = true))]
     pub fn vacuum(
         &mut self,
         dry_run: bool,
         retention_hours: Option<u64>,
         enforce_retention_duration: bool,
     ) -> PyResult<Vec<String>> {
-        rt()?
-            .block_on(
-                self._table
-                    .vacuum(retention_hours, dry_run, enforce_retention_duration),
-            )
-            .map_err(PyDeltaTableError::from_vacuum_error)
+        let mut cmd = VacuumBuilder::new(self._table.object_store(), self._table.state.clone())
+            .with_enforce_retention_duration(enforce_retention_duration)
+            .with_dry_run(dry_run);
+        if let Some(retention_period) = retention_hours {
+            cmd = cmd.with_retention_period(Duration::hours(retention_period as i64));
+        }
+        let (table, metrics) = rt()?
+            .block_on(async { cmd.await })
+            .map_err(PyDeltaTableError::from_raw)?;
+        self._table.state = table.state;
+        Ok(metrics.files_deleted)
     }
 
     // Run the History command on the Delta Table: Returns provenance information, including the operation, user, and so on, for each write to a table.
@@ -285,15 +336,15 @@ impl RawDeltaTable {
 
     pub fn update_incremental(&mut self) -> PyResult<()> {
         rt()?
-            .block_on(self._table.update_incremental())
+            .block_on(self._table.update_incremental(None))
             .map_err(PyDeltaTableError::from_raw)
     }
 
     pub fn dataset_partitions<'py>(
         &mut self,
         py: Python<'py>,
-        partition_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
         schema: PyArrowType<ArrowSchema>,
+        partition_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
     ) -> PyResult<Vec<(String, Option<&'py PyAny>)>> {
         let path_set = match partition_filters {
             Some(filters) => Some(HashSet::<_>::from_iter(
@@ -319,12 +370,85 @@ impl RawDeltaTable {
             .collect()
     }
 
+    fn get_active_partitions<'py>(
+        &self,
+        partitions_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
+        py: Python<'py>,
+    ) -> PyResult<&'py PyFrozenSet> {
+        let column_names: HashSet<&str> = self
+            ._table
+            .schema()
+            .ok_or_else(|| PyDeltaTableError::new_err("table does not yet have a schema"))?
+            .get_fields()
+            .iter()
+            .map(|field| field.get_name())
+            .collect();
+        let partition_columns: HashSet<&str> = self
+            ._table
+            .get_metadata()
+            .map_err(PyDeltaTableError::from_raw)?
+            .partition_columns
+            .iter()
+            .map(|col| col.as_str())
+            .collect();
+
+        if let Some(filters) = &partitions_filters {
+            let unknown_columns: Vec<&str> = filters
+                .iter()
+                .map(|(column_name, _, _)| *column_name)
+                .filter(|column_name| !column_names.contains(column_name))
+                .collect();
+            if !unknown_columns.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "Filters include columns that are not in table schema: {unknown_columns:?}"
+                )));
+            }
+
+            let non_partition_columns: Vec<&str> = filters
+                .iter()
+                .map(|(column_name, _, _)| *column_name)
+                .filter(|column_name| !partition_columns.contains(column_name))
+                .collect();
+
+            if !non_partition_columns.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "Filters include columns that are not partition columns: {non_partition_columns:?}"
+                )));
+            }
+        }
+
+        let converted_filters = convert_partition_filters(partitions_filters.unwrap_or_default())
+            .map_err(PyDeltaTableError::from_raw)?;
+
+        let partition_columns: Vec<&str> = partition_columns.into_iter().collect();
+
+        let active_partitions: HashSet<Vec<(&str, Option<&str>)>> = self
+            ._table
+            .get_state()
+            .get_active_add_actions_by_partitions(&converted_filters)
+            .map_err(PyDeltaTableError::from_raw)?
+            .map(|add| {
+                partition_columns
+                    .iter()
+                    .map(|col| (*col, add.partition_values.get(*col).unwrap().as_deref()))
+                    .collect()
+            })
+            .collect();
+
+        let active_partitions: Vec<&'py PyFrozenSet> = active_partitions
+            .into_iter()
+            .map(|part| PyFrozenSet::new(py, part.iter()))
+            .collect::<Result<_, PyErr>>()?;
+        PyFrozenSet::new(py, active_partitions.into_iter())
+    }
+
     fn create_write_transaction(
         &mut self,
         add_actions: Vec<PyAddAction>,
         mode: &str,
         partition_by: Vec<String>,
         schema: PyArrowType<ArrowSchema>,
+        partitions_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
     ) -> PyResult<()> {
         let mode = save_mode_from_str(mode)?;
         let schema: Schema = (&schema.0)
@@ -343,8 +467,17 @@ impl RawDeltaTable {
 
         match mode {
             SaveMode::Overwrite => {
-                // Remove all current files
-                for old_add in self._table.get_state().files().iter() {
+                let converted_filters =
+                    convert_partition_filters(partitions_filters.unwrap_or_default())
+                        .map_err(PyDeltaTableError::from_raw)?;
+
+                let add_actions = self
+                    ._table
+                    .get_state()
+                    .get_active_add_actions_by_partitions(&converted_filters)
+                    .map_err(PyDeltaTableError::from_raw)?;
+
+                for old_add in add_actions {
                     let remove_action = Action::remove(action::Remove {
                         path: old_add.path.clone(),
                         deletion_timestamp: Some(current_timestamp()),
@@ -378,17 +511,19 @@ impl RawDeltaTable {
             }
         }
 
-        let mut transaction = self
-            ._table
-            .create_transaction(Some(DeltaTransactionOptions::new(3)));
-        transaction.add_actions(actions);
+        let operation = DeltaOperation::Write {
+            mode,
+            partition_by: Some(partition_by),
+            predicate: None,
+        };
+        let store = self._table.object_store();
+
         rt()?
-            .block_on(transaction.commit(
-                Some(DeltaOperation::Write {
-                    mode,
-                    partition_by: Some(partition_by),
-                    predicate: None,
-                }),
+            .block_on(commit(
+                &*store,
+                &actions,
+                operation,
+                self._table.get_state(),
                 None,
             ))
             .map_err(PyDeltaTableError::from_raw)?;
@@ -400,8 +535,38 @@ impl RawDeltaTable {
         Ok(filesystem::DeltaFileSystemHandler {
             inner: self._table.object_store(),
             rt: Arc::new(rt()?),
+            config: self._config.clone(),
         })
     }
+
+    pub fn create_checkpoint(&self) -> PyResult<()> {
+        rt()?
+            .block_on(create_checkpoint(&self._table))
+            .map_err(PyDeltaTableError::from_checkpoint)?;
+
+        Ok(())
+    }
+
+    pub fn get_add_actions(&self, flatten: bool) -> PyResult<PyArrowType<RecordBatch>> {
+        Ok(PyArrowType(
+            self._table
+                .get_state()
+                .add_actions_table(flatten)
+                .map_err(PyDeltaTableError::from_raw)?,
+        ))
+    }
+}
+
+fn convert_partition_filters<'a>(
+    partitions_filters: Vec<(&'a str, &'a str, PartitionFilterValue<'a>)>,
+) -> Result<Vec<PartitionFilter<&'a str>>, deltalake::DeltaTableError> {
+    partitions_filters
+        .into_iter()
+        .map(|filter| match filter {
+            (key, op, PartitionFilterValue::Single(v)) => PartitionFilter::try_from((key, op, v)),
+            (key, op, PartitionFilterValue::Multiple(v)) => PartitionFilter::try_from((key, op, v)),
+        })
+        .collect()
 }
 
 fn json_value_to_py(value: &serde_json::Value, py: Python) -> PyObject {
@@ -442,10 +607,7 @@ fn filestats_to_expression<'py>(
             schema
                 .field_with_name(column_name)
                 .map_err(|_| {
-                    PyDeltaTableError::new_err(format!(
-                        "Column not found in schema: {}",
-                        column_name
-                    ))
+                    PyDeltaTableError::new_err(format!("Column not found in schema: {column_name}"))
                 })?
                 .data_type()
                 .clone(),
@@ -517,6 +679,21 @@ fn filestats_to_expression<'py>(
 #[pyfunction]
 fn rust_core_version() -> &'static str {
     deltalake::crate_version()
+}
+
+#[pyfunction]
+fn batch_distinct(batch: PyArrowType<RecordBatch>) -> PyResult<PyArrowType<RecordBatch>> {
+    let ctx = SessionContext::new();
+    let schema = batch.0.schema();
+    ctx.register_batch("batch", batch.0)
+        .map_err(PyDeltaTableError::from_datafusion)?;
+    let batches = rt()?
+        .block_on(async { ctx.table("batch").await?.distinct()?.collect().await })
+        .map_err(PyDeltaTableError::from_datafusion)?;
+
+    Ok(PyArrowType(
+        concat_batches(&schema, &batches).map_err(PyDeltaTableError::from_arrow)?,
+    ))
 }
 
 fn save_mode_from_str(value: &str) -> PyResult<SaveMode> {
@@ -644,13 +821,10 @@ impl PyDeltaDataChecker {
 // module name need to match project name
 fn _internal(py: Python, m: &PyModule) -> PyResult<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(pyo3::wrap_pyfunction!(rust_core_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(write_new_deltalake, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(
-        asyncio::write_new_deltalake_async,
-        m
-    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(batch_distinct, m)?)?;
     m.add_class::<RawDeltaTable>()?;
     m.add_class::<asyncio::RawAsyncDeltaTable>()?;
     m.add_class::<RawDeltaTableMetaData>()?;

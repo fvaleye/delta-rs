@@ -32,7 +32,6 @@ once_cell = "1.16.0"
 parking_lot = "0.12"
 parquet = { version = "36", features = [
     "async",
-    "json",
     "object_store",
 ], optional = true }
 parquet2 = { version = "0.17", optional = true }
@@ -91,6 +90,7 @@ utime = "0.3"
 glibc_version = { path = "../glibc_version", version = "0.1" }
 
 [features]
+azure = ["object_store/azure"]
 default = ["arrow", "parquet"]
 datafusion = [
     "dep:datafusion",
@@ -104,8 +104,14 @@ datafusion = [
     "parquet",
 ]
 datafusion-ext = ["datafusion"]
-azure = ["object_store/azure"]
 gcs = ["object_store/gcp"]
+glue = ["s3", "rusoto_glue/rustls"]
+glue-native-tls = ["s3-native-tls", "rusoto_glue"]
+hdfs = ["datafusion-objectstore-hdfs"]
+# used only for integration testing
+integration_test = ["fs_extra", "tempdir"]
+json = ["parquet/json"]
+python = ["arrow/pyarrow"]
 s3-native-tls = [
     "rusoto_core/native-tls",
     "rusoto_credential",
@@ -124,13 +130,6 @@ s3 = [
     "object_store/aws",
     "object_store/aws_profile",
 ]
-hdfs = ["datafusion-objectstore-hdfs"]
-glue-native-tls = ["s3-native-tls", "rusoto_glue"]
-glue = ["s3", "rusoto_glue/rustls"]
-python = ["arrow/pyarrow"]
-
-# used only for integration testing
-integration_test = ["fs_extra", "tempdir"]
 
 [[bench]]
 name = "read_checkpoint"
