@@ -15,8 +15,6 @@ async fn test_concurrent_writes_local() -> TestResult {
     Ok(())
 }
 
-// rustls doesn't support http scheme, so we are skipping the test when s3-rustls is enabled.
-#[cfg(feature = "s3")]
 #[tokio::test]
 async fn concurrent_writes_s3() -> TestResult {
     test_concurrent_writes(StorageIntegration::Amazon).await?;
@@ -27,6 +25,15 @@ async fn concurrent_writes_s3() -> TestResult {
 #[tokio::test]
 async fn test_concurrent_writes_azure() -> TestResult {
     test_concurrent_writes(StorageIntegration::Microsoft).await?;
+    Ok(())
+}
+
+// tracked via https://github.com/datafusion-contrib/datafusion-objectstore-hdfs/issues/13
+#[ignore]
+#[cfg(feature = "hdfs")]
+#[tokio::test]
+async fn test_concurrent_writes_hdfs() -> TestResult {
+    test_concurrent_writes(StorageIntegration::Hdfs).await?;
     Ok(())
 }
 

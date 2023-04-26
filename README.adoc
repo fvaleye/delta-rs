@@ -6,6 +6,7 @@ image:https://github.com/delta-io/delta-rs/workflows/build/badge.svg[Build Statu
 image:https://img.shields.io/crates/v/deltalake.svg?style=flat-square[Crate,link=https://crates.io/crates/deltalake]
 image:https://img.shields.io/badge/docs-rust-blue.svg?style=flat-square[Docs,link=https://docs.rs/deltalake]
 image:https://img.shields.io/pypi/v/deltalake.svg?style=flat-square[Python binding,link=https://pypi.org/project/deltalake]
+image:https://img.shields.io/pypi/dm/deltalake?style=flat-square[PyPI - Downloads,link=https://pypi.org/project/deltalake]
 image:https://img.shields.io/badge/docs-python-blue.svg?style=flat-square[Docs,link=https://delta-io.github.io/delta-rs/python]
 
 image::logo.png[Delta-rs logo]
@@ -21,7 +22,7 @@ used with data processing frameworks like
 link:https://github.com/apache/arrow-datafusion[datafusion],
 link:https://github.com/apache/arrow-datafusion/tree/master/ballista[ballista],
 link:https://github.com/pola-rs/polars[polars],
-link:https://github.com/rajasekarv/vega[vega], etc. It also provides bindings to other higher level languages such as link:https://delta-io.github.io/delta-rs/python/[Python] or Ruby.
+link:https://github.com/rajasekarv/vega[vega], etc. It also provides bindings to other higher level language link:https://delta-io.github.io/delta-rs/python/[Python].
 
 === Features
 
@@ -31,62 +32,54 @@ link:https://github.com/rajasekarv/vega[vega], etc. It also provides bindings to
 * AWS S3
 * Azure Blob Storage / Azure Datalake Storage Gen2
 * Google Cloud Storage
+* HDFS
 
 .Support features
 |===
-| Operation/Feature | Rust | Python | Ruby
+| Operation/Feature | Rust | Python
 
 | Read table
 | :heavy_check_mark: 
 | :heavy_check_mark: 
-| :heavy_check_mark:
 
 | Stream table update
 | :heavy_check_mark: 
 | :heavy_check_mark: 
-|
 
 | Filter files with partitions
 | :heavy_check_mark: 
 | :heavy_check_mark: 
-|
 
 | Vacuum (delete stale files)
 | :heavy_check_mark: 
 | :heavy_check_mark: 
-|
 
 | History
 | :heavy_check_mark:
 | :heavy_check_mark:
-|
 
 | Write transactions
 | :heavy_check_mark:
-|
 |
 
 | Checkpoint creation
 | :heavy_check_mark:
 |
-|
 
 | High-level file writer
 |
 | :heavy_check_mark: 
-|
 
 | Optimize
 | :heavy_check_mark: 
 | link:https://github.com/delta-io/delta-rs/issues/622[#622]
-|
 
 |===
 
 
 == Get Involved
 
-Join link:https://dbricks.co/delta-users-slack[#delta-rs in the Delta Lake Slack workspace]
+Join link:https://join.slack.com/t/delta-users/shared_invite/zt-1t1ahwrpx-hIEXnP20PCDzcBSf5V3heA[#delta-rs in the Delta Lake Slack workspace]
 
 === Development Meeting
 
@@ -109,7 +102,3 @@ The `rust/` directory contains core Rust APIs for accessing Delta Lake from Rust
 === Python
 
 The `python/` directory contains the `deltalake` Python package built on top of delta-rs
-
-=== Ruby
-
-The `ruby/` directory contains an early prototype of a Ruby library built on top of delta-rs

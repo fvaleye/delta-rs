@@ -12,7 +12,7 @@ pub type TestResult = Result<(), Box<dyn std::error::Error + 'static>>;
 
 /// The IntegrationContext provides temporary resources to test against cloud storage services.
 pub struct IntegrationContext {
-    integration: StorageIntegration,
+    pub integration: StorageIntegration,
     bucket: String,
     store: Arc<DynObjectStore>,
     tmp_dir: TempDir,
@@ -46,14 +46,14 @@ impl IntegrationContext {
                 account_path.as_path().to_str().unwrap(),
             );
         }
-        integration.crate_bucket(&bucket)?;
+        integration.create_bucket(&bucket)?;
         let store_uri = match integration {
             StorageIntegration::Amazon => format!("s3://{}", &bucket),
             StorageIntegration::Microsoft => format!("az://{}", &bucket),
             StorageIntegration::Google => format!("gs://{}", &bucket),
             StorageIntegration::Local => format!("file://{}", &bucket),
+            StorageIntegration::Hdfs => format!("hdfs://localhost:9000/{}", &bucket),
         };
-
         // the "storage_backend" will always point to the root ofg the object store.
         // TODO should we provide the store via object_Store builders?
         let store = match integration {
@@ -86,7 +86,14 @@ impl IntegrationContext {
             StorageIntegration::Microsoft => format!("az://{}", &self.bucket),
             StorageIntegration::Google => format!("gs://{}", &self.bucket),
             StorageIntegration::Local => format!("file://{}", &self.bucket),
+            StorageIntegration::Hdfs => format!("hdfs://localhost:9000/{}", &self.bucket),
         }
+    }
+
+    pub fn table_builder(&self, table: TestTables) -> DeltaTableBuilder {
+        let name = table.as_name();
+        let table_uri = format!("{}/{}", self.root_uri(), &name);
+        DeltaTableBuilder::from_uri(table_uri).with_allow_http(true)
     }
 
     pub fn uri_for_table(&self, table: TestTables) -> String {
@@ -109,12 +116,12 @@ impl IntegrationContext {
                 options.content_only = true;
                 let dest_path = self.tmp_dir.path().join(name.as_ref());
                 std::fs::create_dir_all(&dest_path)?;
-                copy(&table.as_path(), &dest_path, &options)?;
+                copy(table.as_path(), &dest_path, &options)?;
             }
             _ => {
                 let from = table.as_path().as_str().to_owned();
                 let to = format!("{}/{}", self.root_uri(), name.as_ref());
-                copy_table(from, None, to, None).await?;
+                copy_table(from, None, to, None, true).await?;
             }
         };
         Ok(())
@@ -125,7 +132,7 @@ impl Drop for IntegrationContext {
     fn drop(&mut self) {
         match self.integration {
             StorageIntegration::Amazon => {
-                s3_cli::delete_bucket(&self.root_uri()).unwrap();
+                s3_cli::delete_bucket(self.root_uri()).unwrap();
                 s3_cli::delete_lock_table().unwrap();
             }
             StorageIntegration::Microsoft => {
@@ -135,6 +142,9 @@ impl Drop for IntegrationContext {
                 gs_cli::delete_bucket(&self.bucket).unwrap();
             }
             StorageIntegration::Local => (),
+            StorageIntegration::Hdfs => {
+                hdfs_cli::delete_dir(&self.bucket).unwrap();
+            }
         };
     }
 }
@@ -145,6 +155,7 @@ pub enum StorageIntegration {
     Microsoft,
     Google,
     Local,
+    Hdfs,
 }
 
 impl StorageIntegration {
@@ -154,17 +165,18 @@ impl StorageIntegration {
             Self::Amazon => s3_cli::prepare_env(),
             Self::Google => gs_cli::prepare_env(),
             Self::Local => (),
+            Self::Hdfs => (),
         }
     }
 
-    fn crate_bucket(&self, name: impl AsRef<str>) -> std::io::Result<()> {
+    fn create_bucket(&self, name: impl AsRef<str>) -> std::io::Result<()> {
         match self {
             Self::Microsoft => {
                 az_cli::create_container(name)?;
                 Ok(())
             }
             Self::Amazon => {
-                s3_cli::create_bucket(&format!("s3://{}", name.as_ref()))?;
+                s3_cli::create_bucket(format!("s3://{}", name.as_ref()))?;
                 set_env_if_not_set(
                     "DYNAMO_LOCK_PARTITION_KEY_VALUE",
                     format!("s3://{}", name.as_ref()),
@@ -177,6 +189,10 @@ impl StorageIntegration {
                 Ok(())
             }
             Self::Local => Ok(()),
+            Self::Hdfs => {
+                hdfs_cli::create_dir(name)?;
+                Ok(())
+            }
         }
     }
 }
@@ -186,6 +202,7 @@ pub enum TestTables {
     Simple,
     SimpleCommit,
     Golden,
+    Delta0_8_0Partitioned,
     Custom(String),
 }
 
@@ -204,6 +221,11 @@ impl TestTables {
                 .to_str()
                 .unwrap()
                 .to_owned(),
+            Self::Delta0_8_0Partitioned => data_path
+                .join("delta-0.8.0-partitioned")
+                .to_str()
+                .unwrap()
+                .to_owned(),
             // the data path for upload does not apply to custom tables.
             Self::Custom(_) => todo!(),
         }
@@ -214,12 +236,14 @@ impl TestTables {
             Self::Simple => "simple".into(),
             Self::SimpleCommit => "simple_commit".into(),
             Self::Golden => "golden".into(),
+            Self::Delta0_8_0Partitioned => "delta-0.8.0-partitioned".into(),
             Self::Custom(name) => name.to_owned(),
         }
     }
 }
 
-fn set_env_if_not_set(key: impl AsRef<str>, value: impl AsRef<str>) {
+/// Set environment variable if it is not set
+pub fn set_env_if_not_set(key: impl AsRef<str>, value: impl AsRef<str>) {
     if std::env::var(key.as_ref()).is_err() {
         std::env::set_var(key.as_ref(), value.as_ref())
     };
@@ -432,5 +456,47 @@ pub mod gs_cli {
     pub fn prepare_env() {
         set_env_if_not_set("GOOGLE_BASE_URL", "http://localhost:4443");
         set_env_if_not_set("GOOGLE_ENDPOINT_URL", "http://localhost:4443/storage/v1/b");
+    }
+}
+
+/// small wrapper around hdfs cli
+pub mod hdfs_cli {
+    use std::env;
+    use std::path::PathBuf;
+    use std::process::{Command, ExitStatus};
+
+    fn hdfs_cli_path() -> PathBuf {
+        let hadoop_home =
+            env::var("HADOOP_HOME").expect("HADOOP_HOME environment variable not set");
+        PathBuf::from(hadoop_home).join("bin").join("hdfs")
+    }
+
+    pub fn create_dir(dir_name: impl AsRef<str>) -> std::io::Result<ExitStatus> {
+        let path = hdfs_cli_path();
+        let mut child = Command::new(&path)
+            .args([
+                "dfs",
+                "-mkdir",
+                "-p",
+                format!("/{}", dir_name.as_ref()).as_str(),
+            ])
+            .spawn()
+            .expect("hdfs command is installed");
+        child.wait()
+    }
+
+    pub fn delete_dir(dir_name: impl AsRef<str>) -> std::io::Result<ExitStatus> {
+        let path = hdfs_cli_path();
+        let mut child = Command::new(&path)
+            .args([
+                "dfs",
+                "-rm",
+                "-r",
+                "-f",
+                format!("/{}", dir_name.as_ref()).as_str(),
+            ])
+            .spawn()
+            .expect("hdfs command is installed");
+        child.wait()
     }
 }

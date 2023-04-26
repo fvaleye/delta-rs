@@ -1,5 +1,4 @@
 import json
-import os.path
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -9,6 +8,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    FrozenSet,
     Iterable,
     Iterator,
     List,
@@ -38,12 +38,12 @@ from pyarrow.lib import RecordBatchReader
 from deltalake.schema import delta_arrow_schema_from_pandas
 
 from ._internal import DeltaDataChecker as _DeltaDataChecker
-from ._internal import PyDeltaTableError
+from ._internal import PyDeltaTableError, batch_distinct
 from ._internal import write_new_deltalake as _write_new_deltalake
 from .table import MAX_SUPPORTED_WRITER_VERSION, DeltaTable, DeltaTableProtocolError
 
 try:
-    import pandas as pd
+    import pandas as pd  # noqa: F811
 except ModuleNotFoundError:
     _has_pandas = False
 else:
@@ -63,7 +63,7 @@ class AddAction:
 
 
 def write_deltalake(
-    table_or_uri: Union[str, DeltaTable],
+    table_or_uri: Union[str, Path, DeltaTable],
     data: Union[
         "pd.DataFrame",
         pa.Table,
@@ -77,6 +77,7 @@ def write_deltalake(
     filesystem: Optional[pa_fs.FileSystem] = None,
     mode: Literal["error", "append", "overwrite", "ignore"] = "error",
     file_options: Optional[ds.ParquetFileWriteOptions] = None,
+    max_partitions: Optional[int] = None,
     max_open_files: int = 1024,
     max_rows_per_file: int = 10 * 1024 * 1024,
     min_rows_per_group: int = 64 * 1024,
@@ -86,14 +87,15 @@ def write_deltalake(
     configuration: Optional[Mapping[str, Optional[str]]] = None,
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
+    partition_filters: Optional[List[Tuple[str, str, Any]]] = None,
 ) -> None:
-    """Write to a Delta Lake table (Experimental)
+    """Write to a Delta Lake table
 
     If the table does not already exist, it will be created.
 
-    This function only supports protocol version 1 currently. If an attempting
-    to write to an existing table with a higher min_writer_version, this
-    function will throw DeltaTableProtocolError.
+    This function only supports writer protocol version 2 currently. When
+    attempting to write to an existing table with a higher min_writer_version,
+    this function will throw DeltaTableProtocolError.
 
     Note that this function does NOT register this table in a data catalog.
 
@@ -113,6 +115,7 @@ def write_deltalake(
         Can be provided with defaults using ParquetFileWriteOptions().make_write_options().
         Please refer to https://github.com/apache/arrow/blob/master/python/pyarrow/_dataset_parquet.pyx#L492-L533
         for the list of available options
+    :param max_partitions: the maximum number of partitions that will be used.
     :param max_open_files: Limits the maximum number of
         files that can be left open while writing. If an attempt is made to open
         too many files then the least recently used file will be closed.
@@ -133,13 +136,15 @@ def write_deltalake(
     :param configuration: A map containing configuration options for the metadata action.
     :param overwrite_schema: If True, allows updating the schema of the table.
     :param storage_options: options passed to the native delta filesystem. Unused if 'filesystem' is defined.
+    :param partition_filters: the partition filters that will be used for partition overwrite.
     """
-
     if _has_pandas and isinstance(data, pd.DataFrame):
         if schema is not None:
             data = pa.Table.from_pandas(data, schema=schema)
         else:
             data, schema = delta_arrow_schema_from_pandas(data)
+
+    table, table_uri = try_get_table_and_table_uri(table_or_uri, storage_options)
 
     if schema is None:
         if isinstance(data, RecordBatchReader):
@@ -151,17 +156,6 @@ def write_deltalake(
 
     if filesystem is not None:
         raise NotImplementedError("Filesystem support is not yet implemented.  #570")
-
-    if isinstance(table_or_uri, str):
-        if "://" in table_or_uri:
-            table_uri = table_or_uri
-        else:
-            # Non-existant local paths are only accepted as fully-qualified URIs
-            table_uri = "file://" + str(Path(table_or_uri).absolute())
-        table = try_get_deltatable(table_or_uri, storage_options)
-    else:
-        table = table_or_uri
-        table_uri = table._table.table_uri()
 
     __enforce_append_only(table=table, configuration=configuration, mode=mode)
 
@@ -190,6 +184,8 @@ def write_deltalake(
 
         if partition_by:
             assert partition_by == table.metadata().partition_columns
+        else:
+            partition_by = table.metadata().partition_columns
 
         if table.protocol().min_writer_version > MAX_SUPPORTED_WRITER_VERSION:
             raise DeltaTableProtocolError(
@@ -223,7 +219,7 @@ def write_deltalake(
                 path,
                 size,
                 partition_values,
-                int(datetime.now().timestamp()),
+                int(datetime.now().timestamp() * 1000),
                 True,
                 json.dumps(stats, cls=DeltaJSONEncoder),
             )
@@ -235,8 +231,52 @@ def write_deltalake(
         invariants = table.schema().invariants
         checker = _DeltaDataChecker(invariants)
 
+        def check_data_is_aligned_with_partition_filtering(
+            batch: pa.RecordBatch,
+        ) -> None:
+            if table is None:
+                return
+            existed_partitions: FrozenSet[
+                FrozenSet[Tuple[str, Optional[str]]]
+            ] = table._table.get_active_partitions()
+            allowed_partitions: FrozenSet[
+                FrozenSet[Tuple[str, Optional[str]]]
+            ] = table._table.get_active_partitions(partition_filters)
+            partition_values = pa.RecordBatch.from_arrays(
+                [
+                    batch.column(column_name)
+                    for column_name in table.metadata().partition_columns
+                ],
+                table.metadata().partition_columns,
+            )
+            partition_values = batch_distinct(partition_values)
+            for i in range(partition_values.num_rows):
+                # Map will maintain order of partition_columns
+                partition_map = {
+                    column_name: __encode_partition_value(
+                        batch.column(column_name)[i].as_py()
+                    )
+                    for column_name in table.metadata().partition_columns
+                }
+                partition = frozenset(partition_map.items())
+                if (
+                    partition not in allowed_partitions
+                    and partition in existed_partitions
+                ):
+                    partition_repr = " ".join(
+                        f"{key}={value}" for key, value in partition_map.items()
+                    )
+                    raise ValueError(
+                        f"Data should be aligned with partitioning. "
+                        f"Data contained values for partition {partition_repr}"
+                    )
+
         def validate_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
             checker.check_batch(batch)
+
+            if mode == "overwrite" and partition_filters:
+                check_data_is_aligned_with_partition_filtering(batch)
+
             return batch
 
         if isinstance(data, RecordBatchReader):
@@ -268,6 +308,7 @@ def write_deltalake(
         min_rows_per_group=min_rows_per_group,
         max_rows_per_group=max_rows_per_group,
         filesystem=filesystem,
+        max_partitions=max_partitions,
     )
 
     if table is None:
@@ -288,6 +329,7 @@ def write_deltalake(
             mode,
             partition_by or [],
             schema,
+            partition_filters,
         )
 
 
@@ -304,14 +346,15 @@ def __enforce_append_only(
     )
     if config_delta_append_only and mode != "append":
         raise ValueError(
-            f"If configuration has delta.appendOnly = 'true', mode must be 'append'. Mode is currently {mode}"
+            "If configuration has delta.appendOnly = 'true', mode must be 'append'."
+            f" Mode is currently {mode}"
         )
 
 
 class DeltaJSONEncoder(json.JSONEncoder):
     def default(self, obj: Any) -> Any:
         if isinstance(obj, bytes):
-            return obj.decode("unicode_escape")
+            return obj.decode("unicode_escape", "backslashreplace")
         elif isinstance(obj, date):
             return obj.isoformat()
         elif isinstance(obj, datetime):
@@ -322,8 +365,33 @@ class DeltaJSONEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
+def try_get_table_and_table_uri(
+    table_or_uri: Union[str, Path, DeltaTable],
+    storage_options: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[DeltaTable], str]:
+    """Parses the `table_or_uri`.
+
+    :param table_or_uri: URI of a table or a DeltaTable object.
+    :param storage_options: Options passed to the native delta filesystem.
+    :raises ValueError: If `table_or_uri` is not of type str, Path or DeltaTable.
+    :returns table: DeltaTable object
+    :return table_uri: URI of the table
+    """
+    if not isinstance(table_or_uri, (str, Path, DeltaTable)):
+        raise ValueError("table_or_uri must be a str, Path or DeltaTable")
+
+    if isinstance(table_or_uri, (str, Path)):
+        table = try_get_deltatable(table_or_uri, storage_options)
+        table_uri = str(table_or_uri)
+    else:
+        table = table_or_uri
+        table_uri = table._table.table_uri()
+
+    return (table, table_uri)
+
+
 def try_get_deltatable(
-    table_uri: str, storage_options: Optional[Dict[str, str]]
+    table_uri: Union[str, Path], storage_options: Optional[Dict[str, str]]
 ) -> Optional[DeltaTable]:
     try:
         return DeltaTable(table_uri, storage_options=storage_options)
@@ -419,3 +487,21 @@ def get_file_stats_from_metadata(
                     maximum for maximum in maximums if maximum is not None
                 )
     return stats
+
+
+def __encode_partition_value(val: Any) -> str:
+    # Rules based on: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+    if isinstance(val, bool):
+        return str(val).lower()
+    if isinstance(val, str):
+        return val
+    elif isinstance(val, (int, float)):
+        return str(val)
+    elif isinstance(val, date):
+        return val.isoformat()
+    elif isinstance(val, datetime):
+        return val.isoformat(sep=" ")
+    elif isinstance(val, bytes):
+        return val.decode("unicode_escape", "backslashreplace")
+    else:
+        raise ValueError(f"Could not encode partition value for type: {val}")

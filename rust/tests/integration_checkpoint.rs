@@ -13,7 +13,7 @@ async fn cleanup_metadata_fs_test() -> TestResult {
     Ok(())
 }
 
-#[cfg(any(feature = "s3", feature = "s3-rustls"))]
+#[cfg(any(feature = "s3", feature = "s3-native-tls"))]
 #[tokio::test]
 #[serial]
 async fn cleanup_metadata_aws_test() -> TestResult {
@@ -36,6 +36,15 @@ async fn cleanup_metadata_azure_test() -> TestResult {
 #[serial]
 async fn cleanup_metadata_gcp_test() -> TestResult {
     let context = IntegrationContext::new(StorageIntegration::Google)?;
+    cleanup_metadata_test(&context).await?;
+    Ok(())
+}
+
+#[cfg(feature = "hdfs")]
+#[tokio::test]
+#[serial]
+async fn cleanup_metadata_hdfs_test() -> TestResult {
+    let context = IntegrationContext::new(StorageIntegration::Hdfs)?;
     cleanup_metadata_test(&context).await?;
     Ok(())
 }

@@ -1,20 +1,19 @@
 //! Command for creating a new delta table
 // https://github.com/delta-io/delta/blob/master/core/src/main/scala/org/apache/spark/sql/delta/commands/CreateDeltaTableCommand.scala
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use crate::{DeltaTableBuilder, DeltaTableMetaData};
-
 use super::transaction::commit;
 use super::{MAX_SUPPORTED_READER_VERSION, MAX_SUPPORTED_WRITER_VERSION};
 use crate::action::{Action, DeltaOperation, MetaData, Protocol, SaveMode};
-use crate::builder::StorageUrl;
+use crate::builder::ensure_table_uri;
+use crate::delta_config::DeltaConfigKey;
 use crate::schema::{SchemaDataType, SchemaField, SchemaTypeStruct};
 use crate::storage::DeltaObjectStore;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use crate::{DeltaTableBuilder, DeltaTableMetaData};
 
 use futures::future::BoxFuture;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(thiserror::Error, Debug)]
 enum CreateError {
@@ -154,19 +153,25 @@ impl CreateBuilder {
     }
 
     /// Set configuration on created table
-    pub fn with_configuration(mut self, configuration: HashMap<String, Option<String>>) -> Self {
-        self.configuration = configuration;
+    pub fn with_configuration(
+        mut self,
+        configuration: HashMap<DeltaConfigKey, Option<impl Into<String>>>,
+    ) -> Self {
+        self.configuration = configuration
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().into(), v.map(|s| s.into())))
+            .collect();
         self
     }
 
     /// Specify a table property in the table configuration
     pub fn with_configuration_property(
         mut self,
-        key: impl Into<String>,
+        key: DeltaConfigKey,
         value: Option<impl Into<String>>,
     ) -> Self {
         self.configuration
-            .insert(key.into(), value.map(|v| v.into()));
+            .insert(key.as_ref().into(), value.map(|v| v.into()));
         self
     }
 
@@ -209,20 +214,20 @@ impl CreateBuilder {
             return Err(CreateError::MissingSchema.into());
         }
 
-        let (table, storage_url) = if let Some(object_store) = self.object_store {
-            let storage_url = StorageUrl::parse(object_store.root_uri())?;
+        let (storage_url, table) = if let Some(object_store) = self.object_store {
             (
+                ensure_table_uri(object_store.root_uri())?
+                    .as_str()
+                    .to_string(),
                 DeltaTable::new(object_store, Default::default()),
-                storage_url,
             )
         } else {
-            let storage_url =
-                StorageUrl::parse(self.location.ok_or(CreateError::MissingLocation)?)?;
+            let storage_url = ensure_table_uri(self.location.ok_or(CreateError::MissingLocation)?)?;
             (
+                storage_url.as_str().to_string(),
                 DeltaTableBuilder::from_uri(&storage_url)
                     .with_storage_options(self.storage_options.unwrap_or_default())
                     .build()?,
-                storage_url,
             )
         };
 
@@ -253,7 +258,7 @@ impl CreateBuilder {
         let operation = DeltaOperation::Create {
             mode: self.mode.clone(),
             metadata: metadata.clone(),
-            location: storage_url.to_string(),
+            location: storage_url,
             protocol: protocol.clone(),
         };
 
@@ -280,7 +285,6 @@ impl std::future::IntoFuture for CreateBuilder {
 
         Box::pin(async move {
             let mode = this.mode.clone();
-            let metadata = this.metadata.clone();
             let (mut table, actions, operation) = this.into_table_and_actions()?;
             if table.object_store().is_delta_table_location().await? {
                 match mode {
@@ -297,10 +301,10 @@ impl std::future::IntoFuture for CreateBuilder {
             }
             let version = commit(
                 table.object_store().as_ref(),
-                0,
-                actions,
+                &actions,
                 operation,
-                metadata,
+                &table.state,
+                None,
             )
             .await?;
             table.load_version(version).await?;
@@ -310,12 +314,13 @@ impl std::future::IntoFuture for CreateBuilder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parquet"))]
 mod tests {
     use super::*;
+    use crate::delta_config::DeltaConfigKey;
     use crate::operations::DeltaOps;
-    use crate::table_properties::APPEND_ONLY;
     use crate::writer::test_utils::get_delta_schema;
+    use tempdir::TempDir;
 
     #[tokio::test]
     async fn test_create() {
@@ -329,6 +334,42 @@ mod tests {
             .unwrap();
         assert_eq!(table.version(), 0);
         assert_eq!(table.get_metadata().unwrap().schema, table_schema)
+    }
+
+    #[tokio::test]
+    async fn test_create_local_relative_path() {
+        let table_schema = get_delta_schema();
+        let tmp_dir = TempDir::new_in(".", "tmp_").unwrap();
+        let relative_path = format!(
+            "./{}",
+            tmp_dir.path().file_name().unwrap().to_str().unwrap()
+        );
+        let table = DeltaOps::try_from_uri(relative_path)
+            .await
+            .unwrap()
+            .create()
+            .with_columns(table_schema.get_fields().clone())
+            .with_save_mode(SaveMode::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
+        assert_eq!(table.get_metadata().unwrap().schema, table_schema)
+    }
+
+    #[tokio::test]
+    async fn test_create_table_local_path() {
+        let schema = get_delta_schema();
+        let tmp_dir = TempDir::new_in(".", "tmp_").unwrap();
+        let relative_path = format!(
+            "./{}",
+            tmp_dir.path().file_name().unwrap().to_str().unwrap()
+        );
+        let table = CreateBuilder::new()
+            .with_location(format!("./{relative_path}"))
+            .with_columns(schema.get_fields().clone())
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
     }
 
     #[tokio::test]
@@ -361,14 +402,14 @@ mod tests {
         let table = CreateBuilder::new()
             .with_location("memory://")
             .with_columns(schema.get_fields().clone())
-            .with_configuration_property(APPEND_ONLY, Some("true"))
+            .with_configuration_property(DeltaConfigKey::AppendOnly, Some("true"))
             .await
             .unwrap();
         let append = table
             .get_metadata()
             .unwrap()
             .configuration
-            .get(APPEND_ONLY)
+            .get(DeltaConfigKey::AppendOnly.as_ref())
             .unwrap()
             .as_ref()
             .unwrap()

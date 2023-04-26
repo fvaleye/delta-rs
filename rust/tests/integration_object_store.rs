@@ -22,8 +22,6 @@ async fn test_object_store_azure() -> TestResult {
     Ok(())
 }
 
-// rustls doesn't support http scheme, so we are skipping the test when s3-rustls is enabled.
-#[cfg(feature = "s3")]
 #[tokio::test]
 #[serial]
 async fn test_object_store_aws() -> TestResult {
@@ -38,6 +36,14 @@ async fn test_object_store_aws() -> TestResult {
 #[serial]
 async fn test_object_store_google() -> TestResult {
     test_object_store(StorageIntegration::Google, false).await?;
+    Ok(())
+}
+
+#[cfg(feature = "hdfs")]
+#[tokio::test]
+#[serial]
+async fn test_object_store_hdfs() -> TestResult {
+    test_object_store(StorageIntegration::Hdfs, false).await?;
     Ok(())
 }
 

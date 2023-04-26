@@ -8,7 +8,8 @@ mod parquet_read;
 #[cfg(feature = "parquet2")]
 pub mod parquet2_read;
 
-use crate::{schema::*, DeltaTableMetaData};
+use crate::delta_config::IsolationLevel;
+use crate::{schema::*, DeltaResult, DeltaTableError, DeltaTableMetaData};
 use percent_encoding::percent_decode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -44,13 +45,20 @@ pub enum ActionError {
         #[from]
         source: parquet::errors::ParquetError,
     },
+    /// Faild to serialize operation
+    #[error("Failed to serialize operation: {source}")]
+    SerializeOperation {
+        #[from]
+        /// The source error
+        source: serde_json::Error,
+    },
 }
 
 fn decode_path(raw_path: &str) -> Result<String, ActionError> {
     percent_decode(raw_path.as_bytes())
         .decode_utf8()
         .map(|c| c.to_string())
-        .map_err(|e| ActionError::InvalidField(format!("Decode path failed for action: {}", e)))
+        .map_err(|e| ActionError::InvalidField(format!("Decode path failed for action: {e}")))
 }
 
 /// Struct used to represent minValues and maxValues in add action statistics.
@@ -149,6 +157,23 @@ pub struct StatsParsed {
     pub null_count: HashMap<String, DeltaDataTypeLong>,
 }
 
+/// Delta AddCDCFile action that describes a parquet CDC data file.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCDCFile {
+    /// A relative path, from the root of the table, or an
+    /// absolute path to a CDC file
+    pub path: String,
+    /// The size of this file in bytes
+    pub size: DeltaDataTypeLong,
+    /// A map from partition column to value for this file
+    pub partition_values: HashMap<String, Option<String>>,
+    /// Should always be set to false because they do not change the underlying data of the table
+    pub data_change: bool,
+    /// Map containing metadata about this file
+    pub tags: Option<HashMap<String, Option<String>>>,
+}
+
 /// Delta log action that describes a parquet data file that is part of the table.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -209,6 +234,12 @@ pub struct Add {
     pub tags: Option<HashMap<String, Option<String>>>,
 }
 
+impl Hash for Add {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+    }
+}
+
 impl Add {
     /// Returns the Add action with path decoded.
     pub fn path_decoded(self) -> Result<Self, ActionError> {
@@ -216,6 +247,7 @@ impl Add {
     }
 
     /// Get whatever stats are available. Uses (parquet struct) parsed_stats if present falling back to json stats.
+    #[cfg(any(feature = "parquet", feature = "parquet2"))]
     pub fn get_stats(&self) -> Result<Option<Stats>, serde_json::error::Error> {
         match self.get_stats_parsed() {
             Ok(Some(stats)) => Ok(Some(stats)),
@@ -228,6 +260,12 @@ impl Add {
                 self.get_json_stats()
             }
         }
+    }
+
+    /// Get whatever stats are available.
+    #[cfg(not(any(feature = "parquet", feature = "parquet2")))]
+    pub fn get_stats(&self) -> Result<Option<Stats>, serde_json::error::Error> {
+        self.get_json_stats()
     }
 
     /// Returns the serde_json representation of stats contained in the action if present.
@@ -299,6 +337,25 @@ impl MetaData {
     /// action.
     pub fn get_schema(&self) -> Result<Schema, serde_json::error::Error> {
         serde_json::from_str(&self.schema_string)
+    }
+}
+
+impl TryFrom<DeltaTableMetaData> for MetaData {
+    type Error = DeltaTableError;
+
+    fn try_from(metadata: DeltaTableMetaData) -> Result<Self, Self::Error> {
+        let schema_string = serde_json::to_string(&metadata.schema)
+            .map_err(|e| DeltaTableError::SerializeSchemaJson { json_err: e })?;
+        Ok(Self {
+            id: metadata.id,
+            name: metadata.name,
+            description: metadata.description,
+            format: metadata.format,
+            schema_string,
+            partition_columns: metadata.partition_columns,
+            created_time: metadata.created_time,
+            configuration: metadata.configuration,
+        })
     }
 }
 
@@ -386,7 +443,43 @@ pub struct Protocol {
     pub min_writer_version: DeltaDataTypeInt,
 }
 
-type CommitInfo = Map<String, Value>;
+/// The commitInfo is a fairly flexible action within the delta specification, where arbitrary data can be stored.
+/// However the reference implementation as well as delta-rs store useful information that may for instance
+/// allow us to be more permissive in commit conflict resolution.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    /// Timestamp in millis when the commit was created
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DeltaDataTypeTimestamp>,
+    /// Id of the user invoking the commit
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Name of the user invoking the commit
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    /// The operation performed during the
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Parameters used for table operation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_parameters: Option<HashMap<String, serde_json::Value>>,
+    /// Version of the table when the operation was started
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_version: Option<i64>,
+    /// The isolation level of the commit
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_level: Option<IsolationLevel>,
+    /// TODO
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_blind_append: Option<bool>,
+    /// Delta engine which created the commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_info: Option<String>,
+    /// Additional provenance information for the commit
+    #[serde(flatten, default)]
+    pub info: Map<String, serde_json::Value>,
+}
 
 /// Represents an action in the Delta log. The Delta log is an aggregate of all actions performed
 /// on the table, so the full list of actions is required to properly read a table.
@@ -395,6 +488,8 @@ pub enum Action {
     /// Changes the current metadata of the table. Must be present in the first version of a table.
     /// Subsequent `metaData` actions completely overwrite previous metadata.
     metaData(MetaData),
+    /// Adds CDC a file to the table state.
+    cdc(AddCDCFile),
     /// Adds a file to the table state.
     add(Add),
     /// Removes a file from the table state.
@@ -406,6 +501,16 @@ pub enum Action {
     protocol(Protocol),
     /// Describes commit provenance information for the table.
     commitInfo(CommitInfo),
+}
+
+impl Action {
+    /// Create a commit info from a map
+    pub fn commit_info(info: Map<String, serde_json::Value>) -> Self {
+        Self::commitInfo(CommitInfo {
+            info,
+            ..Default::default()
+        })
+    }
 }
 
 /// Operation performed when creating a new log entry with one or more actions.
@@ -439,6 +544,13 @@ pub enum DeltaOperation {
         /// The predicate used during the write.
         predicate: Option<String>,
     },
+
+    /// Delete data matching predicate from delta table
+    Delete {
+        /// The condition the to be deleted data must match
+        predicate: Option<String>,
+    },
+
     /// Represents a Delta `StreamingUpdate` operation.
     #[serde(rename_all = "camelCase")]
     StreamingUpdate {
@@ -458,32 +570,99 @@ pub enum DeltaOperation {
         predicate: Option<String>,
         /// Target optimize size
         target_size: DeltaDataTypeLong,
-    }, // TODO: Add more operations
+    },
+    #[serde(rename_all = "camelCase")]
+    /// Represents a `FileSystemCheck` operation
+    FileSystemCheck {},
+    // TODO: Add more operations
 }
 
 impl DeltaOperation {
+    /// A human readable name for the operation
+    pub fn name(&self) -> &str {
+        // operation names taken from https://learn.microsoft.com/en-us/azure/databricks/delta/history#--operation-metrics-keys
+        match &self {
+            DeltaOperation::Create { mode, .. } if matches!(mode, SaveMode::Overwrite) => {
+                "CREATE OR REPLACE TABLE"
+            }
+            DeltaOperation::Create { .. } => "CREATE TABLE",
+            DeltaOperation::Write { .. } => "WRITE",
+            DeltaOperation::Delete { .. } => "DELETE",
+            DeltaOperation::StreamingUpdate { .. } => "STREAMING UPDATE",
+            DeltaOperation::Optimize { .. } => "OPTIMIZE",
+            DeltaOperation::FileSystemCheck { .. } => "FSCK",
+        }
+    }
+
+    /// Parameters configured for operation.
+    pub fn operation_parameters(&self) -> DeltaResult<HashMap<String, Value>> {
+        if let Some(Some(Some(map))) = serde_json::to_value(self)
+            .map_err(|err| ActionError::SerializeOperation { source: err })?
+            .as_object()
+            .map(|p| p.values().next().map(|q| q.as_object()))
+        {
+            Ok(map
+                .iter()
+                .filter(|item| !item.1.is_null())
+                .map(|(k, v)| {
+                    (
+                        k.to_owned(),
+                        serde_json::Value::String(if v.is_string() {
+                            String::from(v.as_str().unwrap())
+                        } else {
+                            v.to_string()
+                        }),
+                    )
+                })
+                .collect())
+        } else {
+            Err(ActionError::Generic(
+                "Operation parameters serialized into unexpected shape".into(),
+            )
+            .into())
+        }
+    }
+
+    /// Denotes if the operation changes the data contained in the table
+    pub fn changes_data(&self) -> bool {
+        match self {
+            Self::Optimize { .. } => false,
+            Self::Create { .. }
+            | Self::FileSystemCheck {}
+            | Self::StreamingUpdate { .. }
+            | Self::Write { .. }
+            | Self::Delete { .. } => true,
+        }
+    }
+
     /// Retrieve basic commit information to be added to Delta commits
-    pub fn get_commit_info(&self) -> Map<String, Value> {
-        let mut commit_info = Map::<String, Value>::new();
-        let operation = match &self {
-            DeltaOperation::Create { .. } => "delta-rs.Create",
-            DeltaOperation::Write { .. } => "delta-rs.Write",
-            DeltaOperation::StreamingUpdate { .. } => "delta-rs.StreamingUpdate",
-            DeltaOperation::Optimize { .. } => "delta-rs.Optimize",
-        };
-        commit_info.insert(
-            "operation".to_string(),
-            serde_json::Value::String(operation.into()),
-        );
+    pub fn get_commit_info(&self) -> CommitInfo {
+        // TODO infer additional info from operation parameters ...
+        CommitInfo {
+            operation: Some(self.name().into()),
+            operation_parameters: self.operation_parameters().ok(),
+            ..Default::default()
+        }
+    }
 
-        if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(self) {
-            commit_info.insert(
-                "operationParameters".to_string(),
-                map.values().next().unwrap().clone(),
-            );
-        };
+    /// Get predicate expression applied when the operation reads data from the table.
+    pub fn read_predicate(&self) -> Option<String> {
+        match self {
+            // TODO add more operations
+            Self::Write { predicate, .. } => predicate.clone(),
+            Self::Delete { predicate, .. } => predicate.clone(),
+            _ => None,
+        }
+    }
 
-        commit_info
+    /// Denotes if the operation reads the entire table
+    pub fn read_whole_table(&self) -> bool {
+        match self {
+            // TODO just adding one operation example, as currently none of the
+            // implemented operations scan the entire table.
+            Self::Write { predicate, .. } if predicate.is_none() => false,
+            _ => false,
+        }
     }
 }
 
@@ -581,5 +760,64 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn test_read_commit_info() {
+        let raw = r#"
+        {
+            "timestamp": 1670892998177,
+            "operation": "WRITE",
+            "operationParameters": {
+                "mode": "Append",
+                "partitionBy": "[\"c1\",\"c2\"]"
+            },
+            "isolationLevel": "Serializable",
+            "isBlindAppend": true,
+            "operationMetrics": {
+                "numFiles": "3",
+                "numOutputRows": "3",
+                "numOutputBytes": "1356"
+            },
+            "engineInfo": "Apache-Spark/3.3.1 Delta-Lake/2.2.0",
+            "txnId": "046a258f-45e3-4657-b0bf-abfb0f76681c"
+        }"#;
+
+        let info = serde_json::from_str::<CommitInfo>(raw);
+        assert!(info.is_ok());
+
+        // assert that commit info has no required filelds
+        let raw = "{}";
+        let info = serde_json::from_str::<CommitInfo>(raw);
+        assert!(info.is_ok());
+
+        // arbitrary field data may be added to commit
+        let raw = r#"
+        {
+            "timestamp": 1670892998177,
+            "operation": "WRITE",
+            "operationParameters": {
+                "mode": "Append",
+                "partitionBy": "[\"c1\",\"c2\"]"
+            },
+            "isolationLevel": "Serializable",
+            "isBlindAppend": true,
+            "operationMetrics": {
+                "numFiles": "3",
+                "numOutputRows": "3",
+                "numOutputBytes": "1356"
+            },
+            "engineInfo": "Apache-Spark/3.3.1 Delta-Lake/2.2.0",
+            "txnId": "046a258f-45e3-4657-b0bf-abfb0f76681c",
+            "additionalField": "more data",
+            "additionalStruct": {
+                "key": "value",
+                "otherKey": 123
+            }
+        }"#;
+
+        let info = serde_json::from_str::<CommitInfo>(raw).expect("should parse");
+        assert!(info.info.contains_key("additionalField"));
+        assert!(info.info.contains_key("additionalStruct"));
     }
 }

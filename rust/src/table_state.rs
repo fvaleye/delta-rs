@@ -1,35 +1,48 @@
 //! The module for delta table state.
 
-use super::{
-    ApplyLogError, CheckPoint, DeltaDataTypeLong, DeltaDataTypeVersion, DeltaTable,
-    DeltaTableConfig, DeltaTableError, DeltaTableMetaData,
+use crate::action::{self, Action, Add};
+use crate::delta_config::TableConfig;
+use crate::partitions::{DeltaTablePartition, PartitionFilter};
+use crate::schema::SchemaDataType;
+use crate::storage::commit_uri_from_version;
+use crate::Schema;
+use crate::{
+    ApplyLogError, DeltaDataTypeLong, DeltaDataTypeVersion, DeltaTable, DeltaTableError,
+    DeltaTableMetaData,
 };
-use crate::action::{self, Action};
-use crate::delta_config;
 use chrono::Utc;
-use object_store::ObjectStore;
+use lazy_static::lazy_static;
+use object_store::{path::Path, ObjectStore};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::io::{BufRead, BufReader, Cursor};
 
+#[cfg(any(feature = "parquet", feature = "parquet2"))]
+use super::{CheckPoint, DeltaTableConfig};
+
 /// State snapshot currently held by the Delta Table instance.
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeltaTableState {
+    // current table version represented by this table state
     version: DeltaDataTypeVersion,
     // A remove action should remain in the state of the table as a tombstone until it has expired.
     // A tombstone expires when the creation timestamp of the delta file exceeds the expiration
     tombstones: HashSet<action::Remove>,
+    // active files for table state
     files: Vec<action::Add>,
-    commit_infos: Vec<Map<String, Value>>,
+    // Information added to individual commits
+    commit_infos: Vec<action::CommitInfo>,
     app_transaction_version: HashMap<String, DeltaDataTypeVersion>,
     min_reader_version: i32,
     min_writer_version: i32,
+    // table metadata corresponding to current version
     current_metadata: Option<DeltaTableMetaData>,
+    // retention period for tombstones in milli-seconds
     tombstone_retention_millis: DeltaDataTypeLong,
+    // retention period for log entries in milli-seconds
     log_retention_millis: DeltaDataTypeLong,
     enable_expired_log_cleanup: bool,
 }
@@ -53,7 +66,7 @@ impl DeltaTableState {
         table: &DeltaTable,
         version: DeltaDataTypeVersion,
     ) -> Result<Self, ApplyLogError> {
-        let commit_uri = table.commit_uri_from_version(version);
+        let commit_uri = commit_uri_from_version(version);
         let commit_log_bytes = table.storage.get(&commit_uri).await?.bytes().await?;
         let reader = BufReader::new(Cursor::new(commit_log_bytes));
 
@@ -83,6 +96,7 @@ impl DeltaTableState {
     }
 
     /// Update DeltaTableState with checkpoint data.
+    #[cfg(any(feature = "parquet", feature = "parquet2"))]
     pub fn process_checkpoint_bytes(
         &mut self,
         data: bytes::Bytes,
@@ -133,6 +147,7 @@ impl DeltaTableState {
     }
 
     /// Construct a delta table state object from checkpoint.
+    #[cfg(any(feature = "parquet", feature = "parquet2"))]
     pub async fn from_checkpoint(
         table: &DeltaTable,
         check_point: &CheckPoint,
@@ -149,7 +164,7 @@ impl DeltaTableState {
     }
 
     /// List of commit info maps.
-    pub fn commit_infos(&self) -> &Vec<Map<String, Value>> {
+    pub fn commit_infos(&self) -> &Vec<action::CommitInfo> {
         &self.commit_infos
     }
 
@@ -188,6 +203,12 @@ impl DeltaTableState {
         self.files.as_ref()
     }
 
+    /// Returns an iterator of file names present in the loaded state
+    #[inline]
+    pub fn file_paths_iter(&self) -> impl Iterator<Item = Path> + '_ {
+        self.files.iter().map(|add| Path::from(add.path.as_ref()))
+    }
+
     /// HashMap containing the last txn version stored for every app id writing txn
     /// actions.
     pub fn app_transaction_version(&self) -> &HashMap<String, DeltaDataTypeVersion> {
@@ -207,6 +228,22 @@ impl DeltaTableState {
     /// The most recent metadata of the table.
     pub fn current_metadata(&self) -> Option<&DeltaTableMetaData> {
         self.current_metadata.as_ref()
+    }
+
+    /// The table schema
+    pub fn schema(&self) -> Option<&Schema> {
+        self.current_metadata.as_ref().map(|m| &m.schema)
+    }
+
+    /// Well known table configuration
+    pub fn table_config(&self) -> TableConfig<'_> {
+        lazy_static! {
+            static ref DUMMY_CONF: HashMap<String, Option<String>> = HashMap::new();
+        }
+        self.current_metadata
+            .as_ref()
+            .map(|meta| TableConfig(&meta.configuration))
+            .unwrap_or_else(|| TableConfig(&DUMMY_CONF))
     }
 
     /// Merges new state information into our state
@@ -283,6 +320,8 @@ impl DeltaTableState {
         require_files: bool,
     ) -> Result<(), ApplyLogError> {
         match action {
+            // TODO: optionally load CDC into TableState
+            action::Action::cdc(_v) => {}
             action::Action::add(v) => {
                 if require_files {
                     self.files.push(v.path_decoded()?);
@@ -301,14 +340,12 @@ impl DeltaTableState {
             action::Action::metaData(v) => {
                 let md = DeltaTableMetaData::try_from(v)
                     .map_err(|e| ApplyLogError::InvalidJson { source: e })?;
-                self.tombstone_retention_millis = delta_config::TOMBSTONE_RETENTION
-                    .get_interval_from_metadata(&md)?
-                    .as_millis() as i64;
-                self.log_retention_millis = delta_config::LOG_RETENTION
-                    .get_interval_from_metadata(&md)?
-                    .as_millis() as i64;
-                self.enable_expired_log_cleanup =
-                    delta_config::ENABLE_EXPIRED_LOG_CLEANUP.get_boolean_from_metadata(&md)?;
+                let table_config = TableConfig(&md.configuration);
+                self.tombstone_retention_millis =
+                    table_config.deleted_file_retention_duration().as_millis() as i64;
+                self.log_retention_millis =
+                    table_config.log_retention_duration().as_millis() as i64;
+                self.enable_expired_log_cleanup = table_config.enable_expired_log_cleanup();
                 self.current_metadata = Some(md);
             }
             action::Action::txn(v) => {
@@ -324,13 +361,49 @@ impl DeltaTableState {
 
         Ok(())
     }
+
+    /// Obtain Add actions for files that match the filter
+    pub fn get_active_add_actions_by_partitions<'a>(
+        &'a self,
+        filters: &'a [PartitionFilter<'a, &'a str>],
+    ) -> Result<impl Iterator<Item = &'a Add> + '_, DeltaTableError> {
+        let current_metadata = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
+
+        let nonpartitioned_columns: Vec<String> = filters
+            .iter()
+            .filter(|f| !current_metadata.partition_columns.contains(&f.key.into()))
+            .map(|f| f.key.to_string())
+            .collect();
+
+        if !nonpartitioned_columns.is_empty() {
+            return Err(DeltaTableError::ColumnsNotPartitioned {
+                nonpartitioned_columns: { nonpartitioned_columns },
+            });
+        }
+
+        let partition_col_data_types: HashMap<&str, &SchemaDataType> = current_metadata
+            .get_partition_col_data_types()
+            .into_iter()
+            .collect();
+
+        let actions = self.files().iter().filter(move |add| {
+            let partitions = add
+                .partition_values
+                .iter()
+                .map(|p| DeltaTablePartition::from_partition_value(p, ""))
+                .collect::<Vec<DeltaTablePartition>>();
+            filters
+                .iter()
+                .all(|filter| filter.match_partitions(&partitions, &partition_col_data_types))
+        });
+        Ok(actions)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use std::collections::HashMap;
 
     #[test]
     fn state_round_trip() {

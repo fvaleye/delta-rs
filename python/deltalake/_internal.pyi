@@ -11,6 +11,8 @@ import pyarrow.fs as fs
 
 from deltalake.writer import AddAction
 
+__version__: str
+
 RawDeltaTable: Any
 RawAsyncDeltaTable: Any
 rust_core_version: Callable[[], str]
@@ -31,6 +33,8 @@ write_new_deltalake: Callable[
     ],
     None,
 ]
+
+def batch_distinct(batch: pa.RecordBatch) -> pa.RecordBatch: ...
 
 # Can't implement inheritance (see note in src/schema.rs), so this is next
 # best thing.
@@ -70,7 +74,7 @@ class MapType:
         key_type: DataType,
         value_type: DataType,
         *,
-        value_contains_null: bool = True
+        value_contains_null: bool = True,
     ) -> None: ...
     type: Literal["map"]
     key_type: DataType
@@ -91,7 +95,7 @@ class Field:
         type: DataType,
         *,
         nullable: bool = True,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None: ...
     name: str
     type: DataType
@@ -125,7 +129,7 @@ class Schema:
     def to_json(self) -> str: ...
     @staticmethod
     def from_json(json: str) -> "Schema": ...
-    def to_pyarrow(self) -> pa.Schema: ...
+    def to_pyarrow(self, as_large_types: bool = False) -> pa.Schema: ...
     @staticmethod
     def from_pyarrow(type: pa.Schema) -> "Schema": ...
 
