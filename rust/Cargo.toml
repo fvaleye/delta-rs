@@ -55,7 +55,7 @@ rusoto_glue = { version = "0.47", default-features = false, optional = true }
 
 # Datafusion
 datafusion = { version = "22", optional = true }
-datafusion-expr = { version = "22", optional = true }
+datafusion-expr = { version = "23", optional = true }
 datafusion-common = { version = "22", optional = true }
 datafusion-proto = { version = "22", optional = true }
 datafusion-sql = { version = "22", optional = true }
