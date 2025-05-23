@@ -1,0 +1,300 @@
+use deltalake_core::kernel::StructType;
+use deltalake_core::operations::update_table_metadata::TableMetadataUpdate;
+use deltalake_core::operations::DeltaOps;
+use serde_json::json;
+
+/// Basic schema for testing
+pub fn get_test_schema() -> StructType {
+    serde_json::from_value(json!({
+      "type": "struct",
+      "fields": [
+        {"name": "id", "type": "integer", "nullable": false, "metadata": {}},
+        {"name": "value", "type": "string", "nullable": true, "metadata": {}},
+      ]
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_update_table_name_valid() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let name = "test_table_name";
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableName(name.to_string()))
+        .await
+        .unwrap();
+
+    let metadata = updated_table.metadata().unwrap();
+    assert_eq!(metadata.name.as_ref().unwrap(), name);
+    assert_eq!(updated_table.version(), 1);
+}
+
+#[tokio::test]
+async fn test_update_table_description_valid() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let description = "This is a test table description";
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableDescription(
+            description.to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let metadata = updated_table.metadata().unwrap();
+    assert_eq!(metadata.description.as_ref().unwrap(), description);
+    assert_eq!(updated_table.version(), 1);
+}
+
+#[tokio::test]
+async fn test_update_table_name_character_limit_valid() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let name_255_chars = "x".repeat(255);
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableName(name_255_chars.clone()))
+        .await
+        .unwrap();
+
+    let metadata = updated_table.metadata().unwrap();
+    assert_eq!(metadata.name.as_ref().unwrap(), &name_255_chars);
+    assert_eq!(updated_table.version(), 1);
+}
+
+#[tokio::test]
+async fn test_update_table_name_character_limit_exceeded() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let name_256_chars = "x".repeat(256);
+    let result = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableName(name_256_chars))
+        .await;
+
+    assert!(result.is_err());
+    let error_message = result.unwrap_err().to_string();
+    assert!(error_message.contains("Table name cannot exceed 255 characters"));
+    assert!(error_message.contains("256 characters"));
+}
+
+#[tokio::test]
+async fn test_update_table_description_character_limit_valid() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let description_4000_chars = "y".repeat(4000);
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableDescription(
+            description_4000_chars.clone(),
+        ))
+        .await
+        .unwrap();
+
+    let metadata = updated_table.metadata().unwrap();
+    assert_eq!(
+        metadata.description.as_ref().unwrap(),
+        &description_4000_chars
+    );
+    assert_eq!(updated_table.version(), 1);
+}
+
+#[tokio::test]
+async fn test_update_table_description_character_limit_exceeded() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let description_4001_chars = "y".repeat(4001);
+    let result = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableDescription(
+            description_4001_chars,
+        ))
+        .await;
+
+    assert!(result.is_err());
+    let error_message = result.unwrap_err().to_string();
+    assert!(error_message.contains("Table description cannot exceed 4,000 characters"));
+    assert!(error_message.contains("4001 characters"));
+}
+
+#[tokio::test]
+async fn test_update_existing_table_name() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let initial_name = "initial_table_name";
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableName(initial_name.to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(updated_table.version(), 1);
+    assert_eq!(
+        updated_table.metadata().unwrap().name.as_ref().unwrap(),
+        initial_name
+    );
+
+    let new_name = "updated_table_name";
+    let final_table = DeltaOps(updated_table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableName(new_name.to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(final_table.version(), 2);
+    assert_eq!(
+        final_table.metadata().unwrap().name.as_ref().unwrap(),
+        new_name
+    );
+}
+
+#[tokio::test]
+async fn test_update_existing_table_description() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let initial_description = "Initial table description";
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableDescription(
+            initial_description.to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(updated_table.version(), 1);
+    assert_eq!(
+        updated_table
+            .metadata()
+            .unwrap()
+            .description
+            .as_ref()
+            .unwrap(),
+        initial_description
+    );
+
+    let new_description = "Updated table description with more details";
+    let final_table = DeltaOps(updated_table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableDescription(
+            new_description.to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(final_table.version(), 2);
+    assert_eq!(
+        final_table
+            .metadata()
+            .unwrap()
+            .description
+            .as_ref()
+            .unwrap(),
+        new_description
+    );
+}
+
+#[tokio::test]
+async fn test_empty_table_name() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableName("".to_string()))
+        .await
+        .unwrap();
+
+    let metadata = updated_table.metadata().unwrap();
+    assert_eq!(metadata.name.as_ref().unwrap(), "");
+    assert_eq!(updated_table.version(), 1);
+}
+
+#[tokio::test]
+async fn test_empty_table_description() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let updated_table = DeltaOps(table)
+        .update_table_metadata()
+        .with_update(TableMetadataUpdate::TableDescription("".to_string()))
+        .await
+        .unwrap();
+
+    let metadata = updated_table.metadata().unwrap();
+    assert_eq!(metadata.description.as_ref().unwrap(), "");
+    assert_eq!(updated_table.version(), 1);
+}
+
+#[tokio::test]
+async fn test_no_update_specified() {
+    let table = DeltaOps::new_in_memory()
+        .create()
+        .with_columns(get_test_schema().fields().cloned())
+        .await
+        .unwrap();
+
+    let result = DeltaOps(table).update_table_metadata().await;
+
+    assert!(result.is_err());
+    let error_message = result.unwrap_err().to_string();
+    assert!(error_message.contains("No metadata update specified"));
+}
+
+#[tokio::test]
+async fn test_helper_methods() {
+    let name_update = TableMetadataUpdate::table_name("test_table").unwrap();
+    assert!(matches!(name_update, TableMetadataUpdate::TableName(_)));
+
+    let desc_update = TableMetadataUpdate::table_description("test description").unwrap();
+    assert!(matches!(
+        desc_update,
+        TableMetadataUpdate::TableDescription(_)
+    ));
+
+    let invalid_name = TableMetadataUpdate::table_name("x".repeat(256));
+    assert!(invalid_name.is_err());
+
+    let invalid_desc = TableMetadataUpdate::table_description("y".repeat(4001));
+    assert!(invalid_desc.is_err());
+}

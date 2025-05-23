@@ -53,6 +53,9 @@ use deltalake::operations::restore::RestoreBuilder;
 use deltalake::operations::set_tbl_properties::SetTablePropertiesBuilder;
 use deltalake::operations::update::UpdateBuilder;
 use deltalake::operations::update_field_metadata::UpdateFieldMetadataBuilder;
+use deltalake::operations::update_table_metadata::{
+    TableMetadataUpdate, UpdateTableMetadataBuilder,
+};
 use deltalake::operations::vacuum::{VacuumBuilder, VacuumMode};
 use deltalake::operations::write::WriteBuilder;
 use deltalake::operations::CustomExecuteHandler;
@@ -1515,6 +1518,36 @@ impl RawDeltaTable {
         if let Some(commit_properties) = maybe_create_commit_properties(commit_properties, None) {
             cmd = cmd.with_commit_properties(commit_properties);
         }
+
+        if self.log_store()?.name() == "LakeFSLogStore" {
+            cmd = cmd.with_custom_execute_handler(Arc::new(LakeFSCustomExecuteHandler {}))
+        }
+
+        let table = rt()
+            .block_on(cmd.into_future())
+            .map_err(PythonError::from)?;
+        self.set_state(table.state)?;
+        Ok(())
+    }
+
+    pub fn set_table_name(&self, name: String) -> PyResult<()> {
+        let mut cmd = UpdateTableMetadataBuilder::new(self.log_store()?, self.cloned_state()?)
+            .with_update(TableMetadataUpdate::TableName(name));
+
+        if self.log_store()?.name() == "LakeFSLogStore" {
+            cmd = cmd.with_custom_execute_handler(Arc::new(LakeFSCustomExecuteHandler {}))
+        }
+
+        let table = rt()
+            .block_on(cmd.into_future())
+            .map_err(PythonError::from)?;
+        self.set_state(table.state)?;
+        Ok(())
+    }
+
+    pub fn set_table_description(&self, description: String) -> PyResult<()> {
+        let mut cmd = UpdateTableMetadataBuilder::new(self.log_store()?, self.cloned_state()?)
+            .with_update(TableMetadataUpdate::TableDescription(description));
 
         if self.log_store()?.name() == "LakeFSLogStore" {
             cmd = cmd.with_custom_execute_handler(Arc::new(LakeFSCustomExecuteHandler {}))
