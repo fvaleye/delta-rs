@@ -32,6 +32,7 @@ use deltalake::logstore::LogStoreRef;
 use deltalake::logstore::{IORuntime, ObjectStoreRef};
 use deltalake::operations::add_column::AddColumnBuilder;
 use deltalake::operations::add_feature::AddTableFeatureBuilder;
+use deltalake::operations::clone::CloneBuilder;
 use deltalake::operations::constraints::ConstraintBuilder;
 use deltalake::operations::convert_to_delta::{ConvertToDeltaBuilder, PartitionStrategy};
 use deltalake::operations::delete::DeleteBuilder;
@@ -396,14 +397,28 @@ impl RawDeltaTable {
                             .map_err(PyErr::from)
                     })?
                     .into_iter()
-                    .map(|p| p.to_string())
+                    .map(|p| {
+                        let s = p.to_string();
+                        if s.starts_with("file:/") && !s.starts_with("file:///") {
+                            s.strip_prefix("file:").unwrap_or(&s).to_string()
+                        } else {
+                            s
+                        }
+                    })
                     .collect())
             } else {
                 match self._table.lock() {
                     Ok(table) => Ok(table
                         .get_files_iter()
                         .map_err(PythonError::from)?
-                        .map(|f| f.to_string())
+                        .map(|f| {
+                            let s = f.to_string();
+                            if s.starts_with("file:/") && !s.starts_with("file:///") {
+                                s.strip_prefix("file:").unwrap_or(&s).to_string()
+                            } else {
+                                s
+                            }
+                        })
                         .collect()),
                     Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
                 }
@@ -675,6 +690,59 @@ impl RawDeltaTable {
         })?;
         self.set_state(table.state)?;
         Ok(serde_json::to_string(&metrics).unwrap())
+    }
+
+    /// Run table cloning operation.
+    #[pyo3(signature = (target_table_uri, is_shallow = true, if_not_exists = false, replace = false, version = None, timestamp = None, tbl_properties = None))]
+    pub fn clone(
+        &self,
+        py: Python,
+        target_table_uri: String,
+        is_shallow: bool,
+        if_not_exists: bool,
+        replace: bool,
+        version: Option<i64>,
+        timestamp: Option<String>,
+        tbl_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<CloneMetrics> {
+        let log_store = self.log_store()?;
+        let cloned_state = self.cloned_state()?;
+
+        let metrics = py.allow_threads(|| {
+            let mut cmd = CloneBuilder::new(log_store, cloned_state)
+                .with_target_table_uri(target_table_uri)
+                .with_is_shallow(is_shallow)
+                .with_if_not_exists(if_not_exists)
+                .with_replace(replace);
+
+            if let Some(version) = version {
+                cmd = cmd.with_version(version);
+            }
+            if let Some(timestamp) = timestamp {
+                cmd = cmd.with_timestamp(timestamp);
+            }
+
+            if let Some(properties) = tbl_properties {
+                cmd = cmd.with_tbl_properties(properties);
+            }
+
+            if self.log_store()?.name() == "LakeFSLogStore" {
+                cmd = cmd.with_custom_execute_handler(Arc::new(LakeFSCustomExecuteHandler {}))
+            }
+
+            rt().block_on(cmd.into_future())
+                .map_err(PythonError::from)
+                .map_err(PyErr::from)
+        })?;
+
+        Ok(CloneMetrics {
+            source_table_size: metrics.source_table_size,
+            source_num_of_files: metrics.source_num_of_files,
+            num_removed_files: metrics.num_removed_files,
+            num_copied_files: metrics.num_copied_files,
+            removed_files_size: metrics.removed_files_size,
+            copied_files_size: metrics.copied_files_size,
+        })
     }
 
     #[pyo3(signature = (fields, commit_properties=None, post_commithook_properties=None))]
@@ -2188,6 +2256,23 @@ pub struct PyPostCommitHookProperties {
     cleanup_expired_logs: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+#[pyclass(name = "CloneMetrics", module = "deltalake._internal")]
+pub struct CloneMetrics {
+    #[pyo3(get)]
+    pub source_table_size: i64,
+    #[pyo3(get)]
+    pub source_num_of_files: i64,
+    #[pyo3(get)]
+    pub num_removed_files: i64,
+    #[pyo3(get)]
+    pub num_copied_files: i64,
+    #[pyo3(get)]
+    pub removed_files_size: i64,
+    #[pyo3(get)]
+    pub copied_files_size: i64,
+}
+
 #[derive(Clone)]
 #[pyclass(name = "Transaction", module = "deltalake._internal")]
 pub struct PyTransaction {
@@ -2550,6 +2635,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQueryBuilder>()?;
     m.add_class::<RawDeltaTableMetaData>()?;
     m.add_class::<PyTransaction>()?;
+    m.add_class::<CloneMetrics>()?;
     // There are issues with submodules, so we will expose them flat for now
     // See also: https://github.com/PyO3/pyo3/issues/759
     m.add_class::<schema::PrimitiveType>()?;

@@ -24,6 +24,7 @@ from arro3.core.types import (
 from deprecated import deprecated
 
 from deltalake._internal import (
+    CloneMetrics,
     DeltaError,
     PyMergeBuilder,
     RawDeltaTable,
@@ -670,6 +671,13 @@ class DeltaTable:
         return TableOptimizer(self)
 
     @property
+    def clone(
+        self,
+    ) -> TableCloner:
+        """Namespace for all table clone related methods."""
+        return TableCloner(self)
+
+    @property
     def alter(
         self,
     ) -> TableAlterer:
@@ -918,9 +926,8 @@ class DeltaTable:
 
         if filters is not None:
             filters = filters_to_expression(filters)
-        return self.to_pyarrow_dataset(
-            partitions=partitions, filesystem=filesystem
-        ).to_table(columns=columns, filter=filters)
+        dataset = self.to_pyarrow_dataset(partitions=partitions, filesystem=filesystem)
+        return dataset.to_table(columns=columns, filter=filters)
 
     def to_pandas(
         self,
@@ -2026,3 +2033,182 @@ class TableOptimizer:
         )
         self.table.update_incremental()
         return json.loads(metrics)
+
+
+class TableCloner:
+    """API for various table cloning commands."""
+
+    def __init__(self, table: DeltaTable) -> None:
+        self.table = table
+
+    def shallow_clone(
+        self,
+        target_table_uri: str,
+        *,
+        if_not_exists: bool = False,
+        replace: bool = False,
+        tbl_properties: Mapping[str, str] | None = None,
+    ) -> CloneMetrics:
+        """
+        Shallow clone a table.
+
+        Shallow clones are fast and don't need to copy all of the underlying data.
+        But it's important to remember that they still reference the same source data.
+        If you shallow clone a Delta Lake table and somebody runs a VACUUM operation on the source data, your shallow clone will be affected.
+
+        Args:
+            target_table_uri: the uri to the target table
+            if_not_exists: If True and the target table already exists, the clone operation is skipped
+                           and the existing table remains. Defaults to False.
+            replace: If True and the target table already exists, it will be replaced by the clone.
+                     Defaults to False.
+                     `if_not_exists` and `replace` cannot both be True.
+            tbl_properties: A map containing custom properties to set on the target table.
+
+        Returns:
+            the metrics from shallow clone
+        """
+        if if_not_exists and replace:
+            raise ValueError("if_not_exists and replace flags cannot both be true.")
+
+        return self.table._table.clone(
+            target_table_uri=target_table_uri,
+            is_shallow=True,
+            if_not_exists=if_not_exists,
+            replace=replace,
+            tbl_properties=tbl_properties,
+        )
+
+    def shallow_clone_at_version(
+        self,
+        version: int,
+        target_table_uri: str,
+        *,
+        if_not_exists: bool = False,
+        replace: bool = False,
+        tbl_properties: Mapping[str, str] | None = None,
+    ) -> CloneMetrics:
+        """
+        Shallow clone a table at a specific version.
+
+        Args:
+            version: the version to clone the table at
+            target_table_uri: the uri to the target table
+            if_not_exists: If True and the target table already exists, the clone operation is skipped
+            replace: If True and the target table already exists, it will be replaced by the clone.
+                     Defaults to False.
+                     `if_not_exists` and `replace` cannot both be True.
+        """
+        if if_not_exists and replace:
+            raise ValueError("if_not_exists and replace flags cannot both be true.")
+
+        self.table._table.clone(
+            target_table_uri=target_table_uri,
+            is_shallow=True,
+            if_not_exists=if_not_exists,
+            replace=replace,
+            version=version,
+            tbl_properties=tbl_properties,
+        )
+
+    def shallow_clone_at_timestamp(
+        self,
+        timestamp: str,
+        target_table_uri: str,
+        *,
+        if_not_exists: bool = False,
+        replace: bool = False,
+        tbl_properties: Mapping[str, str] | None = None,
+    ) -> CloneMetrics:
+        """
+        Shallow clone a table at a specific timestamp.
+
+        Args:
+            timestamp: the timestamp to clone the table at
+            target_table_uri: the uri to the target table
+            if_not_exists: If True and the target table already exists, the clone operation is skipped
+            replace: If True and the target table already exists, it will be replaced by the clone.
+                     Defaults to False.
+                     `if_not_exists` and `replace` cannot both be True.
+        """
+        if if_not_exists and replace:
+            raise ValueError("if_not_exists and replace flags cannot both be true.")
+
+        self.table._table.clone(
+            target_table_uri=target_table_uri,
+            is_shallow=True,
+            if_not_exists=if_not_exists,
+            replace=replace,
+            timestamp=timestamp,
+            tbl_properties=tbl_properties,
+        )
+
+    def deep_clone(
+        self,
+        target_table_uri: str,
+        *,
+        if_not_exists: bool = False,
+        replace: bool = False,
+        tbl_properties: Mapping[str, str] | None = None,
+    ) -> CloneMetrics:
+        """
+        Deep clone a table.
+
+        Deep clones are slower than shallow clones, but they copy all of the underlying data.
+        If you deep clone a Delta Lake table and somebody runs a VACUUM operation on the source data, your deep clone will not be affected.
+
+        Args:
+            target_table_uri: the uri to the target table
+            if_not_exists: If True and the target table already exists, the clone operation is skipped
+        """
+        self.table._table.clone(
+            target_table_uri=target_table_uri,
+            is_shallow=True,
+            if_not_exists=if_not_exists,
+            replace=replace,
+            tbl_properties=tbl_properties,
+        )
+
+    def deep_clone_at_version(
+        self,
+        version: int,
+        target_table_uri: str,
+        *,
+        if_not_exists: bool = False,
+        replace: bool = False,
+        tbl_properties: Mapping[str, str] | None = None,
+    ) -> CloneMetrics:
+        """
+        Deep clone a table at a specific version.
+
+        Args:
+            version: the version to clone the table at
+            target_table_uri: the uri to the target table
+            if_not_exists: If True and the target table already exists, the clone operation is skipped
+            replace: If True and the target table already exists, it will be replaced by the clone.
+                     Defaults to False.
+                     `if_not_exists` and `replace` cannot both be True.
+        """
+        raise NotImplementedError("Deep clone at version is not implemented yet.")
+
+    def deep_clone_at_timestamp(
+        self,
+        timestamp: str,
+        target_table_uri: str,
+        *,
+        if_not_exists: bool = False,
+        replace: bool = False,
+        tbl_properties: Mapping[str, str] | None = None,
+    ) -> CloneMetrics:
+        """
+        Deep clone a table at a specific timestamp.
+
+        Args:
+            timestamp: the timestamp to clone the table at
+            target_table_uri: the uri to the target table
+            if_not_exists: If True and the target table already exists, the clone operation is skipped
+            replace: If True and the target table already exists, it will be replaced by the clone.
+                     Defaults to False.
+                     `if_not_exists` and `replace` cannot both be True.
+        """
+        raise NotImplementedError("Deep clone at timestamp is not implemented yet.")

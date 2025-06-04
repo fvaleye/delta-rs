@@ -370,6 +370,19 @@ pub enum DeltaOperation {
         /// The metadata update to apply
         metadata_update: crate::operations::update_table_metadata::TableMetadataUpdate,
     },
+
+    /// Represents a Delta `Clone` operation
+    #[serde(rename_all = "camelCase")]
+    Clone {
+        /// URI of the source table being cloned
+        source_table_uri: String,
+        /// URI of the target table where clone is created
+        target_table_uri: String,
+        /// Whether this is a shallow clone (references) or deep clone (copies)
+        shallow: bool,
+        /// The storage location of the new table
+        location: String,
+    },
 }
 
 impl DeltaOperation {
@@ -399,6 +412,7 @@ impl DeltaOperation {
             DeltaOperation::AddFeature { .. } => "ADD FEATURE",
             DeltaOperation::UpdateFieldMetadata { .. } => "UPDATE FIELD METADATA",
             DeltaOperation::UpdateTableMetadata { .. } => "UPDATE TABLE METADATA",
+            DeltaOperation::Clone { .. } => "CLONE",
         }
     }
 
@@ -449,7 +463,8 @@ impl DeltaOperation {
             | Self::Delete { .. }
             | Self::Merge { .. }
             | Self::Update { .. }
-            | Self::Restore { .. } => true,
+            | Self::Restore { .. }
+            | Self::Clone { .. } => true,
         }
     }
 
@@ -737,7 +752,7 @@ mod tests {
                 ("path", Arc::new(array::StringArray::from(vec![
                     "k=A/part-00000-b1f1dbbb-70bc-4970-893f-9bb772bf246e.c000.snappy.parquet",
                     "k=__HIVE_DEFAULT_PARTITION__/part-00001-8474ac85-360b-4f58-b3ea-23990c71b932.c000.snappy.parquet"
-                ]))),
+                ]) as Arc<dyn arrow_array::Array>)),
                 ("size_bytes", Arc::new(array::Int64Array::from(vec![460, 460]))),
                 ("modification_time", Arc::new(arrow::array::TimestampMillisecondArray::from(vec![
                     1627990384000, 1627990384000

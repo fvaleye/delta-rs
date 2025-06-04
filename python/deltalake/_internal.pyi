@@ -28,6 +28,31 @@ if TYPE_CHECKING:
     )
 __version__: str
 
+class CloneMetrics:
+    """Metrics returned from table cloning operations."""
+
+    source_table_size: int
+    source_num_of_files: int
+    num_removed_files: int
+    num_copied_files: int
+    removed_files_size: int
+    copied_files_size: int
+
+    def __init__(
+        self,
+        source_table_size: int,
+        source_num_of_files: int,
+        num_removed_files: int,
+        num_copied_files: int,
+        removed_files_size: int,
+        copied_files_size: int,
+    ) -> None: ...
+    def total_size(self) -> int: ...
+    def format_sizes(self) -> str: ...
+    def to_json(self) -> str: ...
+    @staticmethod
+    def from_json(json_str: str) -> CloneMetrics: ...
+
 class TableFeatures(Enum):
     # Mapping of one column to another
     ColumnMapping = "ColumnMapping"
@@ -129,6 +154,14 @@ class RawDeltaTable:
         commit_properties: CommitProperties | None,
         post_commithook_properties: PostCommitHookProperties | None,
     ) -> str: ...
+    def clone(
+        self,
+        target_uri: str,
+        is_shallow: bool,
+        if_not_exists: bool,
+        replace: bool,
+        tbl_properties: Mapping[str, str] | None,
+    ) -> CloneMetrics: ...
     def add_columns(
         self,
         fields: list[Field],

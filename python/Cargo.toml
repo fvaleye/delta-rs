@@ -43,6 +43,7 @@ env_logger = "0"
 regex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 parking_lot = "0.12"
 

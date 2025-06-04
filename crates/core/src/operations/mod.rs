@@ -19,6 +19,7 @@ use arrow_array::RecordBatch;
 pub use datafusion_physical_plan::common::collect as collect_sendable_stream;
 
 use self::add_column::AddColumnBuilder;
+use self::clone::CloneBuilder;
 use self::create::CreateBuilder;
 use self::filesystem_check::FileSystemCheckBuilder;
 #[cfg(feature = "datafusion")]
@@ -41,6 +42,7 @@ use crate::DeltaTable;
 pub mod add_column;
 pub mod add_feature;
 pub mod cast;
+pub mod clone;
 pub mod convert_to_delta;
 pub mod create;
 pub mod drop_constraints;
@@ -309,6 +311,11 @@ impl DeltaOps {
     /// Update table metadata
     pub fn update_table_metadata(self) -> UpdateTableMetadataBuilder {
         UpdateTableMetadataBuilder::new(self.0.log_store, self.0.state.unwrap())
+    }
+
+    /// Clone a table to a new location
+    pub fn clone(self) -> CloneBuilder {
+        CloneBuilder::new(self.0.log_store, self.0.state.unwrap())
     }
 }
 
