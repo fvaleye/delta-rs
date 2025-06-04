@@ -47,11 +47,6 @@ class CloneMetrics:
         removed_files_size: int,
         copied_files_size: int,
     ) -> None: ...
-    def total_size(self) -> int: ...
-    def format_sizes(self) -> str: ...
-    def to_json(self) -> str: ...
-    @staticmethod
-    def from_json(json_str: str) -> CloneMetrics: ...
 
 class TableFeatures(Enum):
     # Mapping of one column to another
@@ -156,9 +151,11 @@ class RawDeltaTable:
     ) -> str: ...
     def clone(
         self,
-        target_uri: str,
+        target_table_uri: str,
         is_shallow: bool,
         if_not_exists: bool,
+        timestamp: str | None,
+        version: int | None,
         replace: bool,
         tbl_properties: Mapping[str, str] | None,
     ) -> CloneMetrics: ...

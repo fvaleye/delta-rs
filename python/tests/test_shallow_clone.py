@@ -1,6 +1,6 @@
 import os
 
-import pandas as pd
+import pyarrow as pa
 import pytest
 
 from deltalake import DeltaTable, write_deltalake
@@ -15,7 +15,7 @@ def test_basic_shallow_clone_should_create_a_new_table_and_reference_the_same_da
     target_table_path = os.path.join(tmp_path, "shallow_cloned_table")
 
     source_table = DeltaTable(source_table_path)
-    source_data = source_table.to_pandas()
+    source_data = source_table.to_pyarrow_table()
     metrics: CloneMetrics = source_table.clone.shallow_clone(
         target_table_uri=target_table_path, if_not_exists=False, replace=False
     )
@@ -28,29 +28,33 @@ def test_basic_shallow_clone_should_create_a_new_table_and_reference_the_same_da
     assert metrics.copied_files_size == 0
 
     target_table = DeltaTable(target_table_path)
-    target_data = target_table.to_pandas()
+    print(source_table.file_uris())
+    print(target_table.file_uris())
+    print(target_table.table_uri)
+    target_data = target_table.to_pyarrow_table()
 
     assert len(target_data) == len(source_data)
-    assert list(target_data.columns) == list(source_data.columns)
+    assert target_data.schema.equals(source_data.schema)
 
-    pd.testing.assert_frame_equal(
-        source_data.sort_values(by=list(source_data.columns)).reset_index(drop=True),
-        target_data.sort_values(by=list(target_data.columns)).reset_index(drop=True),
-        check_like=True,
+    # Sort both tables by all columns and compare
+    source_sorted = source_data.sort_by(
+        [(col, "ascending") for col in source_data.column_names]
     )
+    target_sorted = target_data.sort_by(
+        [(col, "ascending") for col in target_data.column_names]
+    )
+
+    assert source_sorted.equals(target_sorted), "Source and target data should be equal"
 
     # For shallow clone, file paths in the target log should be absolute to source data files
     # This assertion needs careful handling of how paths are stored and retrieved.
-    # Assuming files() returns paths as stored in log, which for shallow clone are absolute.
-    source_data_files_abs = {
-        (f"{os.path.abspath(source_table_path)}/{f}") for f in source_table.files()
-    }
-    target_log_files = set(target_table.files())
+    # Assuming file_uris() returns paths as stored in log, which for shallow clone are absolute.
+    source_data_files = set(source_table.file_uris())
+    target_data_files = set(target_table.file_uris())
 
-    assert (
-        target_log_files.issubset(source_data_files_abs)
-        or target_log_files == source_data_files_abs
-    ), "Shallow clone should reference the same data files from the source"
+    assert source_data_files == target_data_files, (
+        "Shallow clone should reference the same data files from the source"
+    )
 
     source_metadata = source_table.metadata()
     clone_metadata = target_table.metadata()
@@ -72,7 +76,7 @@ def test_shallow_clone_if_not_exists(tmp_path, sample_table):
     )
     target_table_v1 = DeltaTable(target_table_path)
     version1 = target_table_v1.version()
-    files_v1 = set(target_table_v1.files())
+    files_v1 = set(target_table_v1.file_uris())
 
     # Attempt second clone with if_not_exists=True
     metrics2 = source_table.clone.shallow_clone(
@@ -80,7 +84,7 @@ def test_shallow_clone_if_not_exists(tmp_path, sample_table):
     )
     target_table_v2 = DeltaTable(target_table_path)
     version2 = target_table_v2.version()
-    files_v2 = set(target_table_v2.files())
+    files_v2 = set(target_table_v2.file_uris())
 
     assert version1 == version2, "Version should not change if clone is skipped"
     assert files_v1 == files_v2, "Files should not change if clone is skipped"
@@ -102,32 +106,36 @@ def test_shallow_clone_replace(tmp_path, sample_table):
     source_table = DeltaTable(source_table_path)
 
     # First clone
-    source_table.clone.shallow_clone(target_table_uri=target_table_path)
-    target_table_v1_data = DeltaTable(target_table_path).to_pandas()
+    source_table.clone.shallow_clone(
+        target_table_uri=target_table_path, if_not_exists=False, replace=False
+    )
+    target_table_v1_data = DeltaTable(target_table_path).to_pyarrow_table()
 
     # Modify source table
-    more_data = pd.DataFrame(
+    more_data = pa.table(
         {"id": [3, 4], "price": [10, 11], "sold": [12, 13], "deleted": [True, False]}
     )
     write_deltalake(source_table_path, more_data, mode="append")  # v1
     source_table.update_incremental()  # Ensure source_table object sees the new version
-    source_v1_data = source_table.to_pandas()
+    source_v1_data = source_table.to_pyarrow_table()
 
     # Clone with replace=True
     metrics_replace = source_table.clone.shallow_clone(
         target_table_uri=target_table_path, if_not_exists=False, replace=True
     )
     target_table_v2 = DeltaTable(target_table_path)
-    target_v2_data = target_table_v2.to_pandas()
+    target_v2_data = target_table_v2.to_pyarrow_table()
 
-    pd.testing.assert_frame_equal(
-        source_v1_data.sort_values(by=list(source_v1_data.columns)).reset_index(
-            drop=True
-        ),
-        target_v2_data.sort_values(by=list(target_v2_data.columns)).reset_index(
-            drop=True
-        ),
-        check_like=True,
+    # Sort both tables and compare
+    source_sorted = source_v1_data.sort_by(
+        [(col, "ascending") for col in source_v1_data.column_names]
+    )
+    target_sorted = target_v2_data.sort_by(
+        [(col, "ascending") for col in target_v2_data.column_names]
+    )
+
+    assert source_sorted.equals(target_sorted), (
+        "Source and target data should be equal after replace"
     )
     assert len(target_table_v1_data) != len(target_v2_data), (
         "Target should have been replaced with new data"

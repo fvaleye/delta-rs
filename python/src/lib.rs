@@ -397,28 +397,14 @@ impl RawDeltaTable {
                             .map_err(PyErr::from)
                     })?
                     .into_iter()
-                    .map(|p| {
-                        let s = p.to_string();
-                        if s.starts_with("file:/") && !s.starts_with("file:///") {
-                            s.strip_prefix("file:").unwrap_or(&s).to_string()
-                        } else {
-                            s
-                        }
-                    })
+                    .map(|p| p.to_string())
                     .collect())
             } else {
                 match self._table.lock() {
                     Ok(table) => Ok(table
                         .get_files_iter()
                         .map_err(PythonError::from)?
-                        .map(|f| {
-                            let s = f.to_string();
-                            if s.starts_with("file:/") && !s.starts_with("file:///") {
-                                s.strip_prefix("file:").unwrap_or(&s).to_string()
-                            } else {
-                                s
-                            }
-                        })
+                        .map(|f| f.to_string())
                         .collect()),
                     Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
                 }
@@ -1142,9 +1128,21 @@ impl RawDeltaTable {
                 }
             })
             .map(|(path, f)| {
+                // For shallow clones, convert absolute paths to URIs so PyArrow can handle them correctly
+                let path_for_pyarrow = if path.starts_with('/') || path.contains("://") {
+                    // This is likely an absolute path from a shallow clone, convert to file URI if needed
+                    if path.starts_with('/') && !path.starts_with("file://") {
+                        format!("file://{}", path)
+                    } else {
+                        path
+                    }
+                } else {
+                    path
+                };
+
                 let expression =
                     filestats_to_expression_next(py, &schema, &inclusion_stats_cols, f)?;
-                Ok((path, expression))
+                Ok((path_for_pyarrow, expression))
             })
             .collect()
     }
