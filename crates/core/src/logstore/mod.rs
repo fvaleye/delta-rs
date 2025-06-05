@@ -538,32 +538,62 @@ pub(crate) fn object_store_path(table_root: &Url) -> DeltaResult<Path> {
 
 /// TODO
 pub fn to_uri(root: &Url, location: &Path) -> String {
+    let location_str = location.as_ref();
+    
+    // Handle absolute URIs in location (e.g., s3://, gcs://, abfss://) regardless of root scheme
+    if location_str.contains("://") {
+        return location_str.to_string();
+    }
+    
     match root.scheme() {
         "file" => {
-            #[cfg(windows)]
-            let uri = format!(
-                "{}/{}",
-                root.as_ref().trim_end_matches('/'),
-                location.as_ref()
-            )
-            .replace("file:///", "");
-            #[cfg(unix)]
-            let uri = format!(
-                "{}/{}",
-                root.as_ref().trim_end_matches('/'),
-                location.as_ref()
-            )
-            .replace("file://", "");
-            uri
+            // Handle file URIs by stripping the scheme prefix
+            if let Some(path) = strip_file_uri_scheme(location_str) {
+                return ensure_absolute_path(path);
+            }
+
+            // Handle relative paths by making them absolute with respect to the table root
+            let uri_intermediate = format!("{}/{}", root.as_ref().trim_end_matches('/'), location_str);
+            let os_abs_path = strip_file_uri_scheme(&uri_intermediate)
+                .map(ensure_absolute_path)
+                .unwrap_or_else(|| {
+                    // Fallback: strip file:// prefix manually
+                    #[cfg(windows)]
+                    let stripped = uri_intermediate.replace("file:///", "");
+                    #[cfg(unix)]
+                    let stripped = uri_intermediate.replace("file://", "");
+                    stripped
+                });
+            
+            os_abs_path
         }
         _ => {
-            if location.as_ref().is_empty() || location.as_ref() == "/" {
+            if location_str.is_empty() || location_str == "/" {
                 root.as_ref().to_string()
             } else {
-                format!("{}/{}", root.as_ref(), location.as_ref())
+                format!("{}/{}", root.as_ref(), location_str)
             }
         }
     }
+}
+
+/// Strip file URI scheme prefixes and return the path portion
+fn strip_file_uri_scheme(uri: &str) -> Option<String> {
+    if uri.starts_with("file:///") {
+        Some(uri.strip_prefix("file:///")?.to_string())
+    } else if uri.starts_with("file:/") && !uri.starts_with("file://") {
+        Some(uri.strip_prefix("file:/")?.to_string())
+    } else {
+        None
+    }
+}
+
+/// Ensure the path starts with '/' to make it a valid OS absolute path
+fn ensure_absolute_path(mut path: String) -> String {
+    if !path.starts_with('/') && !path.is_empty() {
+        path.insert(0, '/');
+    }
+    path
 }
 
 /// Reads a commit and gets list of actions

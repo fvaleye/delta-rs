@@ -370,6 +370,19 @@ pub enum DeltaOperation {
         /// The metadata update to apply
         metadata_update: crate::operations::update_table_metadata::TableMetadataUpdate,
     },
+
+    /// Represents a Delta `Clone` operation
+    #[serde(rename_all = "camelCase")]
+    Clone {
+        /// URI of the source table being cloned
+        source_table_uri: String,
+        /// URI of the target table where clone is created
+        target_table_uri: String,
+        /// Whether this is a shallow clone (references) or deep clone (copies)
+        shallow: bool,
+        /// The storage location of the new table
+        location: String,
+    },
 }
 
 impl DeltaOperation {
@@ -399,6 +412,7 @@ impl DeltaOperation {
             DeltaOperation::AddFeature { .. } => "ADD FEATURE",
             DeltaOperation::UpdateFieldMetadata { .. } => "UPDATE FIELD METADATA",
             DeltaOperation::UpdateTableMetadata { .. } => "UPDATE TABLE METADATA",
+            DeltaOperation::Clone { .. } => "CLONE",
         }
     }
 
@@ -449,7 +463,8 @@ impl DeltaOperation {
             | Self::Delete { .. }
             | Self::Merge { .. }
             | Self::Update { .. }
-            | Self::Restore { .. } => true,
+            | Self::Restore { .. }
+            | Self::Clone { .. } => true,
         }
     }
 

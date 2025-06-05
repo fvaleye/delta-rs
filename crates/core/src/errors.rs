@@ -195,6 +195,10 @@ pub enum DeltaTableError {
         json_err: serde_json::error::Error,
     },
 
+    /// Error returned when a clone operation cannot be completed as specified.
+    #[error("Clone operation failed: {0}")]
+    CloneFailed(String),
+
     /// Generic Delta Table error
     #[error("Generic DeltaTable error: {0}")]
     Generic(String),

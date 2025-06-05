@@ -91,6 +91,20 @@ impl DeltaFileSystemHandler {
 
     fn normalize_path(&self, path: String) -> PyResult<String> {
         let suffix = if path.ends_with('/') { "/" } else { "" };
+
+        // For shallow clones, we need to handle absolute paths and file:// URIs correctly
+        // If the path starts with file:// or is an absolute path (starts with /),
+        // we should not normalize it relative to the table root
+        if path.starts_with("file://") {
+            // Return the file URI as-is (without normalizing as a Path)
+            return Ok(format!("{}{}", path, suffix));
+        } else if path.starts_with('/') {
+            // This is an absolute path, likely from a shallow clone
+            // Return it as-is without Path::parse normalization
+            return Ok(format!("{}{}", path, suffix));
+        }
+
+        // For regular relative paths, use the normal normalization
         let path = Path::parse(path).unwrap();
         Ok(format!("{path}{suffix}"))
     }
@@ -276,13 +290,35 @@ impl DeltaFileSystemHandler {
             None => None,
         };
 
-        let path = Self::parse_path(&path);
+        // For shallow clones, we need to handle absolute paths differently
+        // Create a different object store for absolute paths
+        let (store, parsed_path) = if path.starts_with('/') || path.starts_with("file://") {
+            // This is an absolute path, likely from a shallow clone
+            // Create a local filesystem object store for this path
+            let local_store = DeltaTableBuilder::from_uri("file:///")
+                .with_storage_options(HashMap::new())
+                .build_storage()
+                .map_err(PythonError::from)?
+                .object_store(None);
+
+            // Parse the path appropriately
+            let parsed_path = if path.starts_with("file://") {
+                // Remove file:// prefix and parse
+                let local_path = path.strip_prefix("file://").unwrap_or(&path);
+                Self::parse_path(local_path)
+            } else {
+                // Use the absolute path as-is
+                Self::parse_path(&path)
+            };
+
+            (local_store, parsed_path)
+        } else {
+            // Use the regular table's object store for relative paths
+            (self.inner.clone(), Self::parse_path(&path))
+        };
+
         let file = tokio::task::block_in_place(|| {
-            rt().block_on(ObjectInputFile::try_new(
-                self.inner.clone(),
-                path,
-                size.copied(),
-            ))
+            rt().block_on(ObjectInputFile::try_new(store, parsed_path, size.copied()))
         })
         .map_err(PythonError::from)?;
         Ok(file)
