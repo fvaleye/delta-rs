@@ -99,13 +99,17 @@ mod tests {
     use crate::writer::test_utils::{get_record_batch, TestResult};
     use crate::DeltaTableBuilder;
     use datafusion::assert_batches_sorted_eq;
+    use std::path::Path;
+    use url::Url;
 
     #[tokio::test]
     async fn test_load_local() -> TestResult {
-        let table = DeltaTableBuilder::from_uri("../test/tests/data/delta-0.8.0")
-            .load()
-            .await
-            .unwrap();
+        let table = DeltaTableBuilder::from_uri(
+            Url::from_directory_path(Path::new("../test/tests/data/delta-0.8.0")).unwrap(),
+        )?
+        .load()
+        .await
+        .unwrap();
 
         let (_table, stream) = DeltaOps(table).load().await?;
         let data = collect_sendable_stream(stream).await?;

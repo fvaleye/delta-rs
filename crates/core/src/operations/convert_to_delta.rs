@@ -519,7 +519,7 @@ impl std::future::IntoFuture for ConvertToDeltaBuilder {
 mod tests {
     use std::fs;
 
-    use arrow::array::{Int32Array, TimestampMicrosecondArray, TimestampMillisecondArray};
+    use arrow::array::{Int32Array, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use delta_kernel::expressions::Scalar;
     use futures::StreamExt;
@@ -608,7 +608,9 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("Failed to convert to Delta table. Location: {path}. Error: {e}")
             });
-        open_table(temp_dir).await.expect("Failed to open table")
+        open_table(ensure_table_uri(temp_dir).unwrap())
+            .await
+            .expect("Failed to open table")
     }
 
     fn assert_delta_table(
