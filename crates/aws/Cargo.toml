@@ -46,7 +46,7 @@ aws-sdk-sts = { version = "=1.73.0", default-features = false, features = [
     "rt-tokio",
 ] }
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
-hyper-tls = { version = "0.5", optional = true }
+hyper-tls = { version = "0.6", optional = true }
 maplit = "1"
 
 [dev-dependencies]
