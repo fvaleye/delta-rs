@@ -11,12 +11,14 @@ use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
 use datafusion::assert_batches_sorted_eq;
+use datafusion::catalog::Session;
 use datafusion::common::scalar::ScalarValue;
 use datafusion::common::ScalarValue::*;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{common::collect, metrics::Label};
@@ -1428,6 +1430,87 @@ mod local {
 
         let expected_schema = Schema::new(vec![Field::new("id", ArrowDataType::Int64, false)]);
         assert_eq!(batch.schema().as_ref(), &expected_schema);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_programmatic_api() -> TestResult {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Florian", "Ion", "Denny"])),
+            ],
+        )?;
+
+        let (_temp_dir, table) = prepare_table(vec![batch1], SaveMode::Overwrite, vec![]).await;
+
+        let ctx = context_with_delta_table_factory();
+        let session_state = ctx.state();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![4, 5])),
+                Arc::new(StringArray::from(vec!["Robert", "Tyler"])),
+            ],
+        )?;
+
+        let input_plan = datafusion::datasource::memory::MemTable::try_new(
+            schema.clone(),
+            vec![vec![batch2.clone()]],
+        )?
+        .scan(&session_state, None, &[], None)
+        .await?;
+
+        let insert_plan = table
+            .insert_into(&session_state, input_plan, InsertOp::Append)
+            .await?;
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let result_stream = insert_plan.execute(0, task_ctx)?;
+        let result_batches = collect(result_stream).await?;
+
+        assert!(!result_batches.is_empty());
+        let count_batch = &result_batches[0];
+        assert_eq!(count_batch.schema().fields().len(), 1);
+        assert_eq!(count_batch.schema().field(0).name(), "count");
+        assert_eq!(
+            count_batch.schema().field(0).data_type(),
+            &ArrowDataType::UInt64
+        );
+
+        let count_column = count_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(count_column.value(0), 2u64);
+
+        let ctx = context_with_delta_table_factory();
+        ctx.register_table("test_table", Arc::new(table))?;
+        let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
+        let batches = df.collect().await?;
+
+        let expected = vec![
+            "+----+---------+",
+            "| id | name    |",
+            "+----+---------+",
+            "| 1  | Florian |",
+            "| 2  | Ion     |",
+            "| 3  | Denny   |",
+            "| 4  | Robert  |",
+            "| 5  | Tyler   |",
+            "+----+---------+",
+        ];
+
+        assert_batches_sorted_eq!(&expected, &batches);
+
         Ok(())
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow_array::BooleanArray;
+use arrow_array::{BooleanArray, RecordBatch};
 use chrono::{DateTime, TimeZone, Utc};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::catalog::TableProvider;
@@ -22,6 +22,7 @@ use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{BinaryExpr, LogicalPlan, Operator};
@@ -48,6 +49,8 @@ use crate::delta_datafusion::{
     get_null_of_arrow_type, register_store, to_correct_scalar_value, DataFusionMixins as _,
 };
 use crate::kernel::{Add, LogDataHandler};
+use crate::operations::write::WriteBuilder;
+use crate::protocol::SaveMode;
 use crate::table::builder::ensure_table_uri;
 use crate::DeltaTable;
 use crate::{logstore::LogStoreRef, table::state::DeltaTableState, DeltaResult, DeltaTableError};
@@ -540,6 +543,25 @@ impl TableProvider for DeltaTable {
         Ok(Arc::new(scan))
     }
 
+    /// Insert into the table
+    /// Return the number of rows inserted
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        register_store(self.log_store(), state.runtime_env().clone());
+
+        let insert_into = DeltaInsertIntoBuilder::new(self.snapshot()?, self.log_store(), state)
+            .with_insert_op(insert_op)
+            .with_input(input)
+            .build()
+            .await?;
+
+        Ok(Arc::new(insert_into))
+    }
+
     fn supports_filters_pushdown(
         &self,
         filter: &[&Expr],
@@ -746,6 +768,226 @@ impl ExecutionPlan for DeltaScan {
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Delta insert into builder
+pub(crate) struct DeltaInsertIntoBuilder<'a> {
+    /// The table state snapshot
+    snapshot: &'a DeltaTableState,
+    /// Delta log store
+    log_store: LogStoreRef,
+    /// The session
+    _session: &'a dyn Session,
+    /// The input execution plan
+    input: Option<Arc<dyn ExecutionPlan>>,
+    /// The insert operation
+    insert_op: Option<InsertOp>,
+}
+
+/// Delta insert into builder
+impl<'a> DeltaInsertIntoBuilder<'a> {
+    /// Create a new DeltaInsertIntoBuilder
+    pub fn new(
+        snapshot: &'a DeltaTableState,
+        log_store: LogStoreRef,
+        session: &'a dyn Session,
+    ) -> Self {
+        DeltaInsertIntoBuilder {
+            snapshot,
+            log_store,
+            _session: session,
+            input: None,
+            insert_op: None,
+        }
+    }
+
+    /// Specify the input execution plan
+    pub fn with_input(mut self, input: Arc<dyn ExecutionPlan>) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Specify the insert operation
+    pub fn with_insert_op(mut self, insert_op: InsertOp) -> Self {
+        self.insert_op = Some(insert_op);
+        self
+    }
+
+    /// Build the DeltaInsertInto operation
+    pub async fn build(self) -> Result<DeltaInsertInto> {
+        let input = self.input.ok_or_else(|| {
+            DataFusionError::Plan(
+                "Input execution plan is required for insert operation".to_string(),
+            )
+        })?;
+
+        let insert_op = self.insert_op.unwrap_or(InsertOp::Append);
+        let properties = input.properties().clone();
+
+        Ok(DeltaInsertInto {
+            snapshot: self.snapshot.clone(),
+            log_store: self.log_store,
+            input,
+            insert_op,
+            metrics: ExecutionPlanMetricsSet::new(),
+            properties,
+        })
+    }
+}
+
+/// Delta Insert Into operation
+#[derive(Debug)]
+pub struct DeltaInsertInto {
+    /// The table state snapshot
+    pub snapshot: DeltaTableState,
+    /// Delta log store
+    pub log_store: LogStoreRef,
+    /// The input execution plan containing data to insert
+    pub input: Arc<dyn ExecutionPlan>,
+    /// The insert operation type (Append, Overwrite, etc.)
+    pub insert_op: InsertOp,
+    /// Metrics for insert operation reported via DataFusion
+    pub metrics: ExecutionPlanMetricsSet,
+    /// Plan properties for DataFusion
+    properties: PlanProperties,
+}
+
+impl DisplayAs for DeltaInsertInto {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DeltaInsertInto")
+    }
+}
+
+impl fmt::Display for DeltaInsertInto {
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DeltaInsertInto")
+    }
+}
+
+/// Execution Plan of DataFusion for Delta Insert Into operation
+impl ExecutionPlan for DeltaInsertInto {
+    fn name(&self) -> &str {
+        "DeltaInsertInto"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]))
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(format!(
+                "DeltaInsertInto wrong number of children {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(DeltaInsertInto {
+            snapshot: self.snapshot.clone(),
+            log_store: self.log_store.clone(),
+            input: children[0].clone(),
+            insert_op: self.insert_op,
+            metrics: self.metrics.clone(),
+            properties: self.properties.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::{stream, TryStreamExt};
+
+        let save_mode = match self.insert_op {
+            InsertOp::Append => SaveMode::Append,
+            InsertOp::Overwrite => SaveMode::Overwrite,
+            InsertOp::Replace => SaveMode::Overwrite, // Replace maps to Overwrite
+        };
+
+        let input_stream = self.input.execute(0, context)?;
+        let log_store = self.log_store.clone();
+        let snapshot = Some(self.snapshot.clone());
+        let schema_clone = self.schema();
+
+        let result_stream = stream::once(async move {
+            let batches: Result<Vec<RecordBatch>, DataFusionError> =
+                input_stream.try_collect().await;
+
+            match batches {
+                Ok(batches) => {
+                    let mut total_rows = 0u64;
+                    let mut non_empty_batches = Vec::new();
+
+                    for batch in batches {
+                        if batch.num_rows() > 0 {
+                            total_rows += batch.num_rows() as u64;
+                            non_empty_batches.push(batch);
+                        }
+                    }
+
+                    let mut result_count = total_rows;
+
+                    if !non_empty_batches.is_empty() {
+                        let write_result = WriteBuilder::new(log_store, snapshot)
+                            .with_save_mode(save_mode)
+                            .with_input_batches(non_empty_batches)
+                            .await;
+
+                        if let Err(e) = write_result {
+                            return Err(DataFusionError::Execution(format!(
+                                "Insert operation failed: {}",
+                                e
+                            )));
+                        }
+                    } else {
+                        result_count = 0;
+                    }
+
+                    let summary_batch = RecordBatch::try_new(
+                        schema_clone,
+                        vec![Arc::new(arrow_array::UInt64Array::from(vec![result_count]))],
+                    );
+                    summary_batch.map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                }
+                Err(e) => {
+                    // Input stream execution failed
+                    Err(DataFusionError::Execution(format!(
+                        "Failed to collect input data for insert operation: {}",
+                        e
+                    )))
+                }
+            }
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            result_stream,
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
