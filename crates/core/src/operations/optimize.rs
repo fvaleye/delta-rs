@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use super::write::writer::{PartitionWriter, PartitionWriterConfig};
 use super::{CustomExecuteHandler, Operation};
-use crate::delta_datafusion::DeltaTableProvider;
+use crate::delta_datafusion::{DeltaSessionConfig, DeltaTableProvider};
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, DEFAULT_RETRIES, PROTOCOL};
 use crate::kernel::{scalars::ScalarExt, Action, Add, PartitionsExt, Remove};
@@ -1104,7 +1104,11 @@ pub(super) mod zorder {
                     .build_arc()?;
                 runtime.register_object_store(&Url::parse("delta-rs://").unwrap(), object_store);
 
-                let ctx = SessionContext::new_with_config_rt(SessionConfig::default(), runtime);
+                // Try to load configuration from environment variables, fallback to default if not available
+                let session_config = DeltaSessionConfig::from_env()
+                    .unwrap_or_else(|_| DeltaSessionConfig::default())
+                    .into();
+                let ctx = SessionContext::new_with_config_rt(session_config, runtime);
                 ctx.register_udf(ScalarUDF::from(datafusion::ZOrderUDF));
                 Ok(Self { columns, ctx })
             }

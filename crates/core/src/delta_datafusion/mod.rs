@@ -1128,6 +1128,14 @@ impl Default for DeltaSessionConfig {
     }
 }
 
+impl DeltaSessionConfig {
+    pub fn from_env() -> Result<Self, datafusion::error::DataFusionError> {
+        let mut config = SessionConfig::from_env()?;
+        config = config.set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+        Ok(DeltaSessionConfig { inner: config })
+    }
+}
+
 impl From<DeltaSessionConfig> for SessionConfig {
     fn from(value: DeltaSessionConfig) -> Self {
         value.inner

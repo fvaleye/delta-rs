@@ -897,3 +897,22 @@ async fn read_parquet_file(
         .await?;
     Ok(concat_batches(&batches[0].schema(), &batches)?)
 }
+
+#[tokio::test]
+async fn test_session_config_from_env() -> Result<(), Box<dyn Error>> {
+    use deltalake_core::delta_datafusion::DeltaSessionConfig;
+
+    std::env::set_var("DATAFUSION_EXECUTION_BATCH_SIZE", "4096");
+    std::env::set_var("DATAFUSION_EXECUTION_TARGET_PARTITIONS", "2");
+
+    let config = DeltaSessionConfig::from_env()?;
+    let session_config: datafusion::prelude::SessionConfig = config.into();
+
+    assert_eq!(session_config.batch_size(), 4096);
+    assert_eq!(session_config.target_partitions(), 2);
+
+    std::env::remove_var("DATAFUSION_EXECUTION_BATCH_SIZE");
+    std::env::remove_var("DATAFUSION_EXECUTION_TARGET_PARTITIONS");
+
+    Ok(())
+}
