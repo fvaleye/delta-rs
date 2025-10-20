@@ -121,55 +121,6 @@ impl DeltaTableBuilder {
         })
     }
 
-    /// Creates `DeltaTableBuilder` from table uri string (deprecated)
-    ///
-    /// Can panic on an invalid URI
-    ///
-    /// ```rust
-    /// # use deltalake_core::table::builder::*;
-    /// let builder = DeltaTableBuilder::from_uri_str("../test/tests/data/delta-0.8.0");
-    /// assert!(true);
-    /// ```
-    #[deprecated(note = "Use from_uri with url::Url instead")]
-    pub fn from_uri_str(table_uri: impl AsRef<str>) -> Self {
-        let url = ensure_table_uri(&table_uri).expect("The specified table_uri is not valid");
-        DeltaTableBuilder::from_uri(url).expect("Failed to create valid builder")
-    }
-
-    /// Creates `DeltaTableBuilder` from verified table uri string (deprecated).
-    ///
-    /// ```rust
-    /// # use deltalake_core::table::builder::*;
-    /// let builder = DeltaTableBuilder::from_valid_uri("memory:///");
-    /// assert!(builder.is_ok(), "Builder failed with {builder:?}");
-    /// ```
-    #[deprecated(note = "Use from_uri with url::Url instead")]
-    pub fn from_valid_uri(table_uri: impl AsRef<str>) -> DeltaResult<Self> {
-        if let Ok(url) = Url::parse(table_uri.as_ref()) {
-            if url.scheme() == "file" {
-                let path = url.to_file_path().map_err(|_| {
-                    DeltaTableError::InvalidTableLocation(table_uri.as_ref().to_string())
-                })?;
-                ensure_file_location_exists(path)?;
-            }
-        } else {
-            let expanded_path = expand_tilde_path(table_uri.as_ref())?;
-            ensure_file_location_exists(expanded_path)?;
-        }
-
-        let url = ensure_table_uri(&table_uri)?;
-        debug!("creating table builder with {url}");
-
-        Ok(Self {
-            table_uri: url.into(),
-            storage_backend: None,
-            version: DeltaVersion::default(),
-            storage_options: None,
-            allow_http: None,
-            table_config: DeltaTableConfig::default(),
-        })
-    }
-
     /// Sets `require_files=false` to the builder
     pub fn without_files(mut self) -> Self {
         self.table_config.require_files = false;
@@ -257,7 +208,7 @@ impl DeltaTableBuilder {
         self
     }
 
-    /// Allows unsecure connections via http.
+    /// Allows insecure connections via http.
     ///
     /// This setting is most useful for testing / development when connecting to emulated services.
     pub fn with_allow_http(mut self, allow_http: bool) -> Self {
@@ -362,28 +313,42 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
         .map(|v| v.key().scheme().to_owned())
         .collect();
 
-    if let Ok(url) = Url::parse(table_uri) {
-        let scheme = url.scheme().to_string();
-        if url.scheme() == "file" {
-            Ok(UriType::LocalPath(url.to_file_path().map_err(|err| {
-                let msg = format!("Invalid table location: {table_uri}\nError: {err:?}");
-                DeltaTableError::InvalidTableLocation(msg)
-            })?))
-        // NOTE this check is required to support absolute windows paths which may properly parse as url
-        } else if known_schemes.contains(&scheme) {
-            Ok(UriType::Url(url))
-        // NOTE this check is required to support absolute windows paths which may properly parse as url
-        // we assume here that a single character scheme is a windows drive letter
-        } else if scheme.len() == 1 {
-            Ok(UriType::LocalPath(expand_tilde_path(table_uri)?))
-        } else {
-            Err(DeltaTableError::InvalidTableLocation(format!(
-                "Unknown scheme: {scheme}. Known schemes: {}",
-                known_schemes.join(",")
-            )))
+    match Url::parse(table_uri) {
+        Ok(url) => {
+            let scheme = url.scheme().to_string();
+            if url.scheme() == "file" {
+                Ok(UriType::LocalPath(url.to_file_path().map_err(|err| {
+                    let msg = format!("Invalid table location: {table_uri}\nError: {err:?}");
+                    DeltaTableError::InvalidTableLocation(msg)
+                })?))
+            // NOTE this check is required to support absolute windows paths which may properly parse as url
+            } else if known_schemes.contains(&scheme) {
+                Ok(UriType::Url(url))
+            // NOTE this check is required to support absolute windows paths which may properly parse as url
+            // we assume here that a single character scheme is a windows drive letter
+            } else if scheme.len() == 1 {
+                Ok(UriType::LocalPath(expand_tilde_path(table_uri)?))
+            } else {
+                Err(DeltaTableError::InvalidTableLocation(format!(
+                    "Unknown scheme: {scheme}. Known schemes: {}",
+                    known_schemes.join(",")
+                )))
+            }
         }
-    } else {
-        Ok(UriType::LocalPath(expand_tilde_path(table_uri)?))
+        Err(url_error) => {
+            match url_error {
+                // The RelativeUrlWithoutBase error _usually_ means this function has been called
+                // with a file path looking thing.
+                url::ParseError::RelativeUrlWithoutBase => {
+                    Ok(UriType::LocalPath(expand_tilde_path(table_uri)?))
+                }
+                // All other parse errors are likely an actually broken URL that should not be
+                // interpreted as anything but
+                _others => Err(DeltaTableError::InvalidTableLocation(format!(
+                    "Could not parse {table_uri} as a URL: {url_error}"
+                ))),
+            }
+        }
     }
 }
 
@@ -597,13 +562,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_uri() {
-        // Urls should round trips as-is
-        DeltaTableBuilder::from_valid_uri("this://is.nonsense")
-            .expect_err("this should be an error");
-    }
-
-    #[test]
     fn test_writer_storage_opts_url_trim() {
         let cases = [
             // Trim Case 1 - Key indicating a url
@@ -694,6 +652,18 @@ mod tests {
             }
             _ => panic!("Expected LocalPath"),
         }
+    }
+
+    #[test]
+    fn test_invalid_url_but_invalid_file_path_too() -> DeltaResult<()> {
+        for wrong in &["s3://arn:aws:s3:::something", "hdfs://"] {
+            let result = ensure_table_uri(wrong);
+            assert!(
+                result.is_err(),
+                "Expected {wrong} parsed into {result:#?} to return an error because I gave it something URLish"
+            );
+        }
+        Ok(())
     }
 
     #[test]

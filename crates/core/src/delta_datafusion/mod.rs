@@ -27,16 +27,15 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow_array::types::UInt16Type;
-use arrow_array::{Array, DictionaryArray, RecordBatch, StringArray, TypedDictionaryArray};
+use arrow::array::types::UInt16Type;
+use arrow::array::{Array, DictionaryArray, RecordBatch, StringArray, TypedDictionaryArray};
+use arrow::error::ArrowError;
 use arrow_cast::display::array_value_to_string;
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef,
+    DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
-use arrow_select::concat::concat_batches;
-use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::common::scalar::ScalarValue;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
@@ -45,24 +44,23 @@ use datafusion::common::{
 };
 use datafusion::datasource::physical_plan::wrap_partition_type_in_dict;
 use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::execution::context::{SessionConfig, SessionContext, SessionState, TaskContext};
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::FunctionRegistry;
+use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::logical_expr::logical_plan::CreateExternalTable;
 use datafusion::logical_expr::utils::conjunction;
-use datafusion::logical_expr::{col, Expr, Extension, LogicalPlan, Volatility};
+use datafusion::logical_expr::{Expr, Extension, LogicalPlan, Volatility};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::LocalLimitExec;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, Statistics};
+use datafusion::prelude::{col, SessionConfig};
 use datafusion::sql::planner::ParserOptions;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::table_configuration::TableConfiguration;
 use either::Either;
-use futures::TryStreamExt;
 use itertools::Itertools;
 use url::Url;
 
@@ -79,14 +77,19 @@ use crate::table::state::DeltaTableState;
 use crate::table::{Constraint, GeneratedColumn};
 use crate::{open_table, open_table_with_storage_options, DeltaTable};
 
+pub use self::session::*;
+
 pub(crate) const PATH_COLUMN: &str = "__delta_rs_path";
 
 pub mod cdf;
+pub mod engine;
 pub mod expr;
+mod find_files;
 pub mod logical;
 pub mod physical;
 pub mod planner;
 mod schema_adapter;
+mod session;
 mod table_provider;
 
 pub use cdf::scan::DeltaCdfTableProvider;
@@ -120,110 +123,118 @@ impl From<DataFusionError> for DeltaTableError {
 /// Convenience trait for calling common methods on snapshot hierarchies
 pub trait DataFusionMixins {
     /// The physical datafusion schema of a table
-    fn arrow_schema(&self) -> DeltaResult<ArrowSchemaRef>;
+    fn read_schema(&self) -> ArrowSchemaRef;
 
     /// Get the table schema as an [`ArrowSchemaRef`]
-    fn input_schema(&self) -> DeltaResult<ArrowSchemaRef>;
+    fn input_schema(&self) -> ArrowSchemaRef;
 
     /// Parse an expression string into a datafusion [`Expr`]
     fn parse_predicate_expression(
         &self,
         expr: impl AsRef<str>,
-        df_state: &SessionState,
+        session: &dyn Session,
     ) -> DeltaResult<Expr>;
 }
 
 impl DataFusionMixins for Snapshot {
-    fn arrow_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        _arrow_schema(self.table_configuration(), true)
+    fn read_schema(&self) -> ArrowSchemaRef {
+        _arrow_schema(
+            self.arrow_schema(),
+            self.metadata().partition_columns(),
+            true,
+        )
     }
 
-    fn input_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        _arrow_schema(self.table_configuration(), false)
+    fn input_schema(&self) -> ArrowSchemaRef {
+        _arrow_schema(
+            self.arrow_schema(),
+            self.metadata().partition_columns(),
+            false,
+        )
     }
 
     fn parse_predicate_expression(
         &self,
         expr: impl AsRef<str>,
-        df_state: &SessionState,
+        session: &dyn Session,
     ) -> DeltaResult<Expr> {
-        let schema = DFSchema::try_from(self.arrow_schema()?.as_ref().to_owned())?;
-        parse_predicate_expression(&schema, expr, df_state)
+        let schema = DFSchema::try_from(self.read_schema().as_ref().to_owned())?;
+        parse_predicate_expression(&schema, expr, session)
     }
 }
 
 impl DataFusionMixins for LogDataHandler<'_> {
-    fn arrow_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        _arrow_schema(self.table_configuration(), true)
+    fn read_schema(&self) -> ArrowSchemaRef {
+        _arrow_schema(
+            Arc::new(
+                self.table_configuration()
+                    .schema()
+                    .as_ref()
+                    .try_into_arrow()
+                    .unwrap(),
+            ),
+            self.table_configuration().metadata().partition_columns(),
+            true,
+        )
     }
 
-    fn input_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        _arrow_schema(self.table_configuration(), false)
+    fn input_schema(&self) -> ArrowSchemaRef {
+        _arrow_schema(
+            Arc::new(
+                self.table_configuration()
+                    .schema()
+                    .as_ref()
+                    .try_into_arrow()
+                    .unwrap(),
+            ),
+            self.table_configuration().metadata().partition_columns(),
+            false,
+        )
     }
 
     fn parse_predicate_expression(
         &self,
         expr: impl AsRef<str>,
-        df_state: &SessionState,
+        session: &dyn Session,
     ) -> DeltaResult<Expr> {
-        let schema = DFSchema::try_from(self.arrow_schema()?.as_ref().to_owned())?;
-        parse_predicate_expression(&schema, expr, df_state)
+        let schema = DFSchema::try_from(self.read_schema().as_ref().to_owned())?;
+        parse_predicate_expression(&schema, expr, session)
     }
 }
 
 impl DataFusionMixins for EagerSnapshot {
-    fn arrow_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        self.snapshot().arrow_schema()
+    fn read_schema(&self) -> ArrowSchemaRef {
+        self.snapshot().read_schema()
     }
 
-    fn input_schema(&self) -> DeltaResult<ArrowSchemaRef> {
+    fn input_schema(&self) -> ArrowSchemaRef {
         self.snapshot().input_schema()
     }
 
     fn parse_predicate_expression(
         &self,
         expr: impl AsRef<str>,
-        df_state: &SessionState,
+        session: &dyn Session,
     ) -> DeltaResult<Expr> {
-        self.snapshot().parse_predicate_expression(expr, df_state)
-    }
-}
-
-impl DataFusionMixins for DeltaTableState {
-    fn arrow_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        self.snapshot.arrow_schema()
-    }
-
-    fn input_schema(&self) -> DeltaResult<ArrowSchemaRef> {
-        self.snapshot.input_schema()
-    }
-
-    fn parse_predicate_expression(
-        &self,
-        expr: impl AsRef<str>,
-        df_state: &SessionState,
-    ) -> DeltaResult<Expr> {
-        self.snapshot.parse_predicate_expression(expr, df_state)
+        self.snapshot().parse_predicate_expression(expr, session)
     }
 }
 
 fn _arrow_schema(
-    snapshot: &TableConfiguration,
+    schema: SchemaRef,
+    partition_columns: &[String],
     wrap_partitions: bool,
-) -> DeltaResult<ArrowSchemaRef> {
-    let meta = snapshot.metadata();
-    let schema = snapshot.schema();
-
+) -> ArrowSchemaRef {
     let fields = schema
         .fields()
-        .filter(|f| !meta.partition_columns().contains(&f.name().to_string()))
-        .map(|f| f.try_into_arrow())
+        .into_iter()
+        .filter(|f| !partition_columns.contains(&f.name().to_string()))
+        .cloned()
         .chain(
             // We need stable order between logical and physical schemas, but the order of
             // partitioning columns is not always the same in the json schema and the array
-            meta.partition_columns().iter().map(|partition_col| {
-                let f = schema.field(partition_col).unwrap();
-                let field: Field = f.try_into_arrow()?;
+            partition_columns.iter().map(|partition_col| {
+                let field = schema.field_with_name(partition_col).unwrap();
                 let corrected = if wrap_partitions {
                     match field.data_type() {
                         // Only dictionary-encode types that may be large
@@ -239,12 +250,11 @@ fn _arrow_schema(
                 } else {
                     field.data_type().clone()
                 };
-                Ok(field.with_data_type(corrected))
+                Arc::new(field.clone().with_data_type(corrected))
             }),
         )
-        .collect::<Result<Vec<Field>, _>>()?;
-
-    Ok(Arc::new(ArrowSchema::new(fields)))
+        .collect::<Vec<_>>();
+    Arc::new(ArrowSchema::new(fields))
 }
 
 pub(crate) fn files_matching_predicate<'a>(
@@ -255,8 +265,8 @@ pub(crate) fn files_matching_predicate<'a>(
         (!filters.is_empty()).then_some(conjunction(filters.iter().cloned()))
     {
         let expr = SessionContext::new()
-            .create_physical_expr(predicate, &log_data.arrow_schema()?.to_dfschema()?)?;
-        let pruning_predicate = PruningPredicate::try_new(expr, log_data.arrow_schema()?)?;
+            .create_physical_expr(predicate, &log_data.read_schema().to_dfschema()?)?;
+        let pruning_predicate = PruningPredicate::try_new(expr, log_data.read_schema())?;
         let mask = pruning_predicate.prune(&log_data)?;
 
         Ok(Either::Left(log_data.into_iter().zip(mask).filter_map(
@@ -299,7 +309,7 @@ impl DeltaTableState {
 
 // each delta table must register a specific object store, since paths are internally
 // handled relative to the table root.
-pub(crate) fn register_store(store: LogStoreRef, env: Arc<RuntimeEnv>) {
+pub(crate) fn register_store(store: LogStoreRef, env: &RuntimeEnv) {
     let object_store_url = store.object_store_url();
     let url: &Url = object_store_url.as_ref();
     env.register_object_store(url, store.object_store(None));
@@ -309,13 +319,13 @@ pub(crate) fn register_store(store: LogStoreRef, env: Arc<RuntimeEnv>) {
 /// columns must appear at the end of the schema. This is to align with how partition are handled
 /// at the physical level
 pub(crate) fn df_logical_schema(
-    snapshot: &DeltaTableState,
+    snapshot: &EagerSnapshot,
     file_column_name: &Option<String>,
     schema: Option<ArrowSchemaRef>,
 ) -> DeltaResult<SchemaRef> {
     let input_schema = match schema {
         Some(schema) => schema,
-        None => snapshot.input_schema()?,
+        None => snapshot.input_schema(),
     };
     let table_partition_cols = snapshot.metadata().partition_columns();
 
@@ -389,6 +399,8 @@ pub(crate) fn get_null_of_arrow_type(t: &ArrowDataType) -> DeltaResult<ScalarVal
         )),
         //Unsupported types...
         ArrowDataType::Float16
+        | ArrowDataType::Decimal32(_, _)
+        | ArrowDataType::Decimal64(_, _)
         | ArrowDataType::Decimal256(_, _)
         | ArrowDataType::Union(_, _)
         | ArrowDataType::LargeList(_)
@@ -482,30 +494,6 @@ pub(crate) fn to_correct_scalar_value(
     }
 }
 
-pub(crate) async fn execute_plan_to_batch(
-    state: &SessionState,
-    plan: Arc<dyn ExecutionPlan>,
-) -> DeltaResult<arrow::record_batch::RecordBatch> {
-    let data = futures::future::try_join_all(
-        (0..plan.properties().output_partitioning().partition_count()).map(|p| {
-            let plan_copy = plan.clone();
-            let task_context = state.task_ctx().clone();
-            async move {
-                let batch_stream = plan_copy.execute(p, task_context)?;
-
-                let schema = batch_stream.schema();
-
-                let batches = batch_stream.try_collect::<Vec<_>>().await?;
-
-                DataFusionResult::<_>::Ok(concat_batches(&schema, batches.iter())?)
-            }
-        }),
-    )
-    .await?;
-
-    Ok(concat_batches(&plan.schema(), data.iter())?)
-}
-
 /// Responsible for checking batches of data conform to table's invariants, constraints and nullability.
 #[derive(Clone, Default)]
 pub struct DeltaDataChecker {
@@ -574,13 +562,13 @@ impl DeltaDataChecker {
     }
 
     /// Create a new DeltaDataChecker
-    pub fn new(snapshot: &DeltaTableState) -> Self {
+    pub fn new(snapshot: &EagerSnapshot) -> Self {
         let invariants = snapshot.schema().get_invariants().unwrap_or_default();
         let generated_columns = snapshot
             .schema()
             .get_generated_columns()
             .unwrap_or_default();
-        let constraints = snapshot.table_config().get_constraints();
+        let constraints = snapshot.table_properties().get_constraints();
         let non_nullable_columns = snapshot
             .schema()
             .fields()
@@ -793,7 +781,7 @@ impl LogicalExtensionCodec for DeltaLogicalCodec {
 #[derive(Debug)]
 pub struct DeltaTableFactory {}
 
-#[async_trait]
+#[async_trait::async_trait]
 impl TableProviderFactory for DeltaTableFactory {
     async fn create(
         &self,
@@ -935,16 +923,19 @@ fn join_batches_with_add_actions(
 
 /// Determine which files contain a record that satisfies the predicate
 pub(crate) async fn find_files_scan(
-    snapshot: &DeltaTableState,
+    snapshot: &EagerSnapshot,
     log_store: LogStoreRef,
     state: &SessionState,
     expression: Expr,
 ) -> DeltaResult<Vec<Add>> {
     let candidate_map: HashMap<String, Add> = snapshot
-        .file_actions_iter(&log_store)
-        .map_ok(|add| (add.path.clone(), add.to_owned()))
-        .try_collect()
-        .await?;
+        .log_data()
+        .iter()
+        .map(|f| {
+            let add = f.add_action();
+            (add.path.clone(), add)
+        })
+        .collect();
 
     let scan_config = DeltaScanConfigBuilder {
         include_file_column: true,
@@ -994,11 +985,11 @@ pub(crate) async fn find_files_scan(
 }
 
 pub(crate) async fn scan_memory_table(
-    log_store: &dyn LogStore,
-    snapshot: &DeltaTableState,
+    _log_store: &dyn LogStore,
+    snapshot: &EagerSnapshot,
     predicate: &Expr,
 ) -> DeltaResult<Vec<Add>> {
-    let actions = snapshot.file_actions(log_store).await?;
+    let actions: Vec<Add> = snapshot.log_data().iter().map(|f| f.add_action()).collect();
 
     let batch = snapshot.add_actions_table(true)?;
     let mut arrays = Vec::new();
@@ -1050,7 +1041,7 @@ pub(crate) async fn scan_memory_table(
 
 /// Finds files in a snapshot that match the provided predicate.
 pub async fn find_files(
-    snapshot: &DeltaTableState,
+    snapshot: &EagerSnapshot,
     log_store: LogStoreRef,
     state: &SessionState,
     predicate: Option<Expr>,
@@ -1086,7 +1077,7 @@ pub async fn find_files(
             }
         }
         None => Ok(FindFiles {
-            candidates: snapshot.file_actions(&log_store).await?,
+            candidates: snapshot.log_data().iter().map(|f| f.add_action()).collect(),
             partition_scan: true,
         }),
     }
@@ -1198,7 +1189,7 @@ impl From<DeltaColumn> for Column {
     }
 }
 
-/// Create a column, resuing the existing datafusion column
+/// Create a column, reusing the existing datafusion column
 impl From<Column> for DeltaColumn {
     fn from(c: Column) -> Self {
         DeltaColumn { inner: c }
@@ -1222,9 +1213,11 @@ mod tests {
     use datafusion::logical_expr::lit;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::{visit_execution_plan, ExecutionPlanVisitor, PhysicalExpr};
+    use datafusion::prelude::{col, SessionConfig};
     use datafusion_proto::physical_plan::AsExecutionPlan;
     use datafusion_proto::protobuf;
     use delta_kernel::path::{LogPathFileType, ParsedLogPath};
+    use delta_kernel::schema::ArrayType;
     use futures::{stream::BoxStream, StreamExt};
     use object_store::ObjectMeta;
     use object_store::{
@@ -1523,13 +1516,16 @@ mod tests {
         let table = crate::open_table(table_url).await.unwrap();
         let config = DeltaScanConfigBuilder::new()
             .with_file_column_name(&"file_source")
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
 
         let log_store = table.log_store();
-        let provider =
-            DeltaTableProvider::try_new(table.snapshot().unwrap().clone(), log_store, config)
-                .unwrap();
+        let provider = DeltaTableProvider::try_new(
+            table.snapshot().unwrap().snapshot().clone(),
+            log_store,
+            config,
+        )
+        .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
@@ -1587,13 +1583,16 @@ mod tests {
             .unwrap();
 
         let config = DeltaScanConfigBuilder::new()
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
 
         let log_store = table.log_store();
-        let provider =
-            DeltaTableProvider::try_new(table.snapshot().unwrap().clone(), log_store, config)
-                .unwrap();
+        let provider = DeltaTableProvider::try_new(
+            table.snapshot().unwrap().snapshot().clone(),
+            log_store,
+            config,
+        )
+        .unwrap();
         let logical_schema = provider.schema();
         let ctx = SessionContext::new();
         ctx.register_table("test", Arc::new(provider)).unwrap();
@@ -1651,12 +1650,13 @@ mod tests {
             .unwrap();
 
         let config = DeltaScanConfigBuilder::new()
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
         let log = table.log_store();
 
         let provider =
-            DeltaTableProvider::try_new(table.snapshot().unwrap().clone(), log, config).unwrap();
+            DeltaTableProvider::try_new(table.snapshot().unwrap().snapshot().clone(), log, config)
+                .unwrap();
         let ctx: SessionContext = DeltaSessionContext::default().into();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
@@ -1743,12 +1743,13 @@ mod tests {
             .unwrap();
 
         let config = DeltaScanConfigBuilder::new()
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
         let log = table.log_store();
 
         let provider =
-            DeltaTableProvider::try_new(table.snapshot().unwrap().clone(), log, config).unwrap();
+            DeltaTableProvider::try_new(table.snapshot().unwrap().snapshot().clone(), log, config)
+                .unwrap();
         let ctx: SessionContext = DeltaSessionContext::default().into();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
@@ -1799,12 +1800,13 @@ mod tests {
             .unwrap();
 
         let config = DeltaScanConfigBuilder::new()
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
         let log = table.log_store();
 
         let provider =
-            DeltaTableProvider::try_new(table.snapshot().unwrap().clone(), log, config).unwrap();
+            DeltaTableProvider::try_new(table.snapshot().unwrap().snapshot().clone(), log, config)
+                .unwrap();
 
         let mut cfg = SessionConfig::default();
         cfg.options_mut().execution.parquet.pushdown_filters = true;
@@ -1895,12 +1897,13 @@ mod tests {
             .unwrap();
 
         let config = DeltaScanConfigBuilder::new()
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
         let log = table.log_store();
 
         let provider =
-            DeltaTableProvider::try_new(table.snapshot().unwrap().clone(), log, config).unwrap();
+            DeltaTableProvider::try_new(table.snapshot().unwrap().snapshot().clone(), log, config)
+                .unwrap();
         let ctx: SessionContext = DeltaSessionContext::default().into();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
@@ -1978,11 +1981,15 @@ mod tests {
 
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let scan = DeltaScanBuilder::new(table.snapshot().unwrap(), table.log_store(), &state)
-            .with_filter(Some(col("a").eq(lit("s"))))
-            .build()
-            .await
-            .unwrap();
+        let scan = DeltaScanBuilder::new(
+            table.snapshot().unwrap().snapshot(),
+            table.log_store(),
+            &state,
+        )
+        .with_filter(Some(col("a").eq(lit("s"))))
+        .build()
+        .await
+        .unwrap();
 
         let mut visitor = ParquetVisitor::default();
         visit_execution_plan(&scan, &mut visitor).unwrap();
@@ -2003,12 +2010,12 @@ mod tests {
         let snapshot = table.snapshot().unwrap();
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let scan = DeltaScanBuilder::new(snapshot, table.log_store(), &state)
+        let scan = DeltaScanBuilder::new(snapshot.snapshot(), table.log_store(), &state)
             .with_filter(Some(col("a").eq(lit("s"))))
             .with_scan_config(
                 DeltaScanConfigBuilder::new()
                     .with_parquet_pushdown(false)
-                    .build(snapshot)
+                    .build(snapshot.snapshot())
                     .unwrap(),
             )
             .build()
@@ -2038,7 +2045,7 @@ mod tests {
         let ctx = SessionContext::new_with_config(config);
         let state = ctx.state();
 
-        let scan = DeltaScanBuilder::new(snapshot, table.log_store(), &state)
+        let scan = DeltaScanBuilder::new(snapshot.snapshot(), table.log_store(), &state)
             .build()
             .await
             .unwrap();
@@ -2157,7 +2164,7 @@ mod tests {
             .unwrap();
 
         let config = DeltaScanConfigBuilder::new()
-            .build(table.snapshot().unwrap())
+            .build(table.snapshot().unwrap().snapshot())
             .unwrap();
 
         let (object_store, mut operations) =
@@ -2170,7 +2177,7 @@ mod tests {
             table.log_store().config().clone(),
         );
         let provider = DeltaTableProvider::try_new(
-            table.snapshot().unwrap().clone(),
+            table.snapshot().unwrap().snapshot().clone(),
             Arc::new(log_store),
             config,
         )
@@ -2193,14 +2200,57 @@ mod tests {
         assert_eq!("a", small.iter().next().unwrap().unwrap());
 
         let expected = vec![
-            ObjectStoreOperation::GetRange(LocationType::Data, 4952..4960),
-            ObjectStoreOperation::GetRange(LocationType::Data, 2399..4952),
+            ObjectStoreOperation::GetRange(LocationType::Data, 957..965),
+            ObjectStoreOperation::GetRange(LocationType::Data, 326..957),
             #[expect(clippy::single_range_in_vec_init)]
-            ObjectStoreOperation::GetRanges(LocationType::Data, vec![4..58]),
+            ObjectStoreOperation::GetRanges(LocationType::Data, vec![4..46]),
         ];
         let mut actual = Vec::new();
         operations.recv_many(&mut actual, 3).await;
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_push_down_filter_panic_2602() -> DeltaResult<()> {
+        use crate::kernel::schema::{DataType, PrimitiveType};
+        let ctx = SessionContext::new();
+        let table = crate::DeltaOps::new_in_memory()
+            .create()
+            .with_column("id", DataType::Primitive(PrimitiveType::Long), true, None)
+            .with_column(
+                "name",
+                DataType::Primitive(PrimitiveType::String),
+                true,
+                None,
+            )
+            .with_column("b", DataType::Primitive(PrimitiveType::Boolean), true, None)
+            .with_column(
+                "ts",
+                DataType::Primitive(PrimitiveType::Timestamp),
+                true,
+                None,
+            )
+            .with_column("dt", DataType::Primitive(PrimitiveType::Date), true, None)
+            .with_column(
+                "zap",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::Primitive(PrimitiveType::Boolean),
+                    true,
+                ))),
+                true,
+                None,
+            )
+            .await?;
+
+        ctx.register_table("snapshot", Arc::new(table)).unwrap();
+
+        let df = ctx
+            .sql("select * from snapshot where id > 10000 and id < 20000")
+            .await
+            .unwrap();
+
+        let _ = df.collect().await?;
+        Ok(())
     }
 
     /// Records operations made by the inner object store on a channel obtained at construction
@@ -2261,7 +2311,7 @@ mod tests {
     }
 
     // Currently only read operations are recorded. Extend as necessary.
-    #[async_trait]
+    #[async_trait::async_trait]
     impl ObjectStore for RecordingObjectStore {
         async fn put(
             &self,

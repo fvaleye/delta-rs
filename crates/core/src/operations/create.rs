@@ -68,7 +68,7 @@ pub struct CreateBuilder {
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for CreateBuilder {
+impl super::Operation for CreateBuilder {
     fn log_store(&self) -> &LogStoreRef {
         self.log_store
             .as_ref()
@@ -303,7 +303,7 @@ impl CreateBuilder {
             })
             .unwrap_or_else(|| current_protocol);
 
-        let schema = StructType::new(self.columns);
+        let schema = StructType::try_new(self.columns)?;
 
         let protocol = protocol
             .apply_properties_to_protocol(&configuration, self.raise_if_key_not_exists)?
@@ -366,7 +366,7 @@ impl std::future::IntoFuture for CreateBuilder {
                         let remove_actions = table
                             .snapshot()?
                             .log_data()
-                            .iter()
+                            .into_iter()
                             .map(|p| p.remove_action(true).into());
                         actions.extend(remove_actions);
                         Some(table.snapshot()?)
@@ -418,7 +418,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        assert_eq!(table.snapshot().unwrap().schema(), &table_schema)
+        assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
     }
 
     #[tokio::test]
@@ -442,7 +442,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        assert_eq!(table.snapshot().unwrap().schema(), &table_schema)
+        assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
     }
 
     #[tokio::test]
@@ -479,7 +479,7 @@ mod tests {
             snapshot.protocol().min_writer_version(),
             PROTOCOL.default_writer_version()
         );
-        assert_eq!(snapshot.schema(), &schema);
+        assert_eq!(snapshot.schema().as_ref(), &schema);
 
         // check we can overwrite default settings via adding actions
         let protocol = ProtocolInner {

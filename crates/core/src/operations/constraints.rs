@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
+use datafusion::catalog::Session;
 use datafusion::common::ToDFSchema;
-use datafusion::execution::context::SessionState;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
 use delta_kernel::table_features::WriterFeature;
 use futures::future::BoxFuture;
 use futures::StreamExt;
@@ -14,22 +13,21 @@ use futures::StreamExt;
 use super::datafusion_utils::into_expr;
 use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
-use crate::delta_datafusion::{
-    register_store, DeltaDataChecker, DeltaScanBuilder, DeltaSessionContext,
-};
+use crate::delta_datafusion::{create_session, register_store, DeltaDataChecker, DeltaScanBuilder};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{MetadataExt, ProtocolExt as _, ProtocolInner};
+use crate::kernel::{
+    resolve_snapshot, EagerSnapshot, MetadataExt, ProtocolExt as _, ProtocolInner,
+};
 use crate::logstore::LogStoreRef;
 use crate::operations::datafusion_utils::Expression;
 use crate::protocol::DeltaOperation;
-use crate::table::state::DeltaTableState;
 use crate::table::Constraint;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 /// Build a constraint to add to a table
 pub struct ConstraintBuilder {
     /// A snapshot of the table's state
-    snapshot: DeltaTableState,
+    snapshot: Option<EagerSnapshot>,
     /// Name of the constraint
     name: Option<String>,
     /// Constraint expression
@@ -37,13 +35,13 @@ pub struct ConstraintBuilder {
     /// Delta object store for handling data files
     log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
-    state: Option<SessionState>,
+    session: Option<Arc<dyn Session>>,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for ConstraintBuilder {
+impl super::Operation for ConstraintBuilder {
     fn log_store(&self) -> &LogStoreRef {
         &self.log_store
     }
@@ -54,13 +52,13 @@ impl super::Operation<()> for ConstraintBuilder {
 
 impl ConstraintBuilder {
     /// Create a new builder
-    pub fn new(log_store: LogStoreRef, snapshot: DeltaTableState) -> Self {
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
         Self {
             name: None,
             expr: None,
             snapshot,
             log_store,
-            state: None,
+            session: None,
             commit_properties: CommitProperties::default(),
             custom_execute_handler: None,
         }
@@ -77,9 +75,9 @@ impl ConstraintBuilder {
         self
     }
 
-    /// Specify the datafusion session context
-    pub fn with_session_state(mut self, state: SessionState) -> Self {
-        self.state = Some(state);
+    /// The Datafusion session state to use
+    pub fn with_session_state(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -105,11 +103,8 @@ impl std::future::IntoFuture for ConstraintBuilder {
         let this = self;
 
         Box::pin(async move {
-            if !this.snapshot.load_config().require_files {
-                return Err(DeltaTableError::NotInitializedWithFiles(
-                    "ADD CONSTRAINTS".into(),
-                ));
-            }
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), true).await?;
+
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
@@ -122,7 +117,7 @@ impl std::future::IntoFuture for ConstraintBuilder {
                 .expr
                 .ok_or_else(|| DeltaTableError::Generic("No Expression provided".to_string()))?;
 
-            let mut metadata = this.snapshot.metadata().clone();
+            let mut metadata = snapshot.metadata().clone();
             let configuration_key = format!("delta.constraints.{name}");
 
             if metadata.configuration().contains_key(&configuration_key) {
@@ -131,18 +126,17 @@ impl std::future::IntoFuture for ConstraintBuilder {
                 )));
             }
 
-            let state = this.state.unwrap_or_else(|| {
-                let session: SessionContext = DeltaSessionContext::default().into();
-                register_store(this.log_store.clone(), session.runtime_env());
-                session.state()
-            });
+            let session = this
+                .session
+                .unwrap_or_else(|| Arc::new(create_session().into_inner().state()));
+            register_store(this.log_store.clone(), session.runtime_env().as_ref());
 
-            let scan = DeltaScanBuilder::new(&this.snapshot, this.log_store.clone(), &state)
+            let scan = DeltaScanBuilder::new(&snapshot, this.log_store.clone(), session.as_ref())
                 .build()
                 .await?;
 
             let schema = scan.schema().to_dfschema()?;
-            let expr = into_expr(expr, &schema, &state)?;
+            let expr = into_expr(expr, &schema, session.as_ref())?;
             let expr_str = fmt_expr_to_sql(&expr)?;
 
             // Checker built here with the one time constraint to check.
@@ -154,9 +148,8 @@ impl std::future::IntoFuture for ConstraintBuilder {
             for p in 0..plan.properties().output_partitioning().partition_count() {
                 let inner_plan = plan.clone();
                 let inner_checker = checker.clone();
-                let task_ctx = Arc::new(TaskContext::from(&state));
                 let mut record_stream: SendableRecordBatchStream =
-                    inner_plan.execute(p, task_ctx)?;
+                    inner_plan.execute(p, session.task_ctx())?;
                 let handle: tokio::task::JoinHandle<DeltaResult<()>> =
                     tokio::task::spawn(async move {
                         while let Some(maybe_batch) = record_stream.next().await {
@@ -180,7 +173,7 @@ impl std::future::IntoFuture for ConstraintBuilder {
             metadata =
                 metadata.add_config_key(format!("delta.constraints.{name}"), expr_str.clone())?;
 
-            let old_protocol = this.snapshot.protocol();
+            let old_protocol = snapshot.protocol();
             let protocol = ProtocolInner {
                 min_reader_version: if old_protocol.min_reader_version() > 1 {
                     old_protocol.min_reader_version()
@@ -218,7 +211,7 @@ impl std::future::IntoFuture for ConstraintBuilder {
                 .with_actions(actions)
                 .with_operation_id(operation_id)
                 .with_post_commit_hook_handler(this.custom_execute_handler.clone())
-                .build(Some(&this.snapshot), this.log_store.clone(), operation)
+                .build(Some(&snapshot), this.log_store.clone(), operation)
                 .await?;
 
             if let Some(handler) = this.custom_execute_handler {
@@ -258,8 +251,7 @@ mod tests {
     }
 
     async fn get_constraint_op_params(table: &mut DeltaTable) -> String {
-        let commit_info = table.history(None).await.unwrap();
-        let last_commit = &commit_info[0];
+        let last_commit = table.last_commit().await.unwrap();
         last_commit
             .operation_parameters
             .as_ref()
