@@ -438,7 +438,7 @@ impl<'a> DeltaScanBuilder<'a> {
         )?;
 
         let logical_schema = if let Some(used_columns) = self.projection {
-            let mut fields = vec![];
+            let mut fields = Vec::with_capacity(used_columns.len());
             for idx in used_columns {
                 fields.push(logical_schema.field(*idx).to_owned());
             }
@@ -517,9 +517,9 @@ impl<'a> DeltaScanBuilder<'a> {
 
                     // needed to enforce limit and deal with missing statistics
                     // rust port of https://github.com/delta-io/delta/pull/1495
-                    let mut pruned_without_stats = vec![];
+                    let mut pruned_without_stats = Vec::new();
                     let mut rows_collected = 0;
-                    let mut files = vec![];
+                    let mut files = Vec::with_capacity(num_containers);
 
                     let file_actions: Vec<_> = self
                         .snapshot
@@ -569,7 +569,8 @@ impl<'a> DeltaScanBuilder<'a> {
         // TODO we group files together by their partition values. If the table is partitioned
         // and partitions are somewhat evenly distributed, probably not the worst choice ...
         // However we may want to do some additional balancing in case we are far off from the above.
-        let mut file_groups: HashMap<Vec<ScalarValue>, Vec<PartitionedFile>> = HashMap::new();
+        let mut file_groups: HashMap<Vec<ScalarValue>, Vec<PartitionedFile>> =
+            HashMap::with_capacity(files.len());
 
         let table_partition_cols = &self.snapshot.metadata().partition_columns();
 

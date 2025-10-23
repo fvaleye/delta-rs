@@ -144,7 +144,7 @@ pub(crate) async fn execute_non_empty_expr(
 ) -> DeltaResult<(Vec<Action>, Option<DataFrame>)> {
     // For each identified file perform a parquet scan + filter + limit (1) + count.
     // If returned count is not zero then append the file to be rewritten and removed from the log. Otherwise do nothing to the file.
-    let mut actions: Vec<Action> = Vec::new();
+    let mut actions: Vec<Action> = Vec::with_capacity(rewrite.len());
 
     // Take the insert plan schema since it might have been schema evolved, if its not
     // it is simply the table schema
@@ -327,7 +327,7 @@ pub(crate) async fn write_execution_plan_v2(
         });
 
         // spawn one worker per partition stream to drive DataFusion concurrently
-        let mut worker_handles = Vec::new();
+        let mut worker_handles = Vec::with_capacity(partition_streams.len());
         let scan_start = std::time::Instant::now();
         for mut partition_stream in partition_streams {
             let tx_clone = tx.clone();
@@ -444,7 +444,7 @@ pub(crate) async fn write_execution_plan_v2(
         });
 
         // spawn partition workers that split batches and send to appropriate writer channel
-        let mut worker_handles = Vec::new();
+        let mut worker_handles = Vec::with_capacity(partition_streams.len());
         let scan_start = std::time::Instant::now();
         for mut partition_stream in partition_streams {
             let txn = tx_normal.clone();

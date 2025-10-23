@@ -344,8 +344,8 @@ impl ConvertToDeltaBuilder {
         }
 
         // Iterate over the parquet files. Parse partition columns, generate add actions and collect parquet file schemas
-        let mut arrow_schemas = Vec::new();
-        let mut actions = Vec::new();
+        let mut arrow_schemas = Vec::with_capacity(files.len());
+        let mut actions = Vec::with_capacity(files.len());
         // partition columns that were defined by caller and are expected to apply on this table
         let mut expected_partitions: HashMap<String, StructField> = self.partition_schema.clone();
         // A HashSet of all unique partition columns in a Parquet table

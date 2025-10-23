@@ -131,9 +131,6 @@ fn stats_from_metadata(
     num_indexed_cols: DataSkippingNumIndexedCols,
     stats_columns: &Option<Vec<impl AsRef<str>>>,
 ) -> Result<Stats, DeltaWriterError> {
-    let mut min_values: HashMap<String, ColumnValueStat> = HashMap::new();
-    let mut max_values: HashMap<String, ColumnValueStat> = HashMap::new();
-    let mut null_count: HashMap<String, ColumnCountStat> = HashMap::new();
     let dialect = sqlparser::dialect::GenericDialect {};
 
     let idx_to_iterate = if let Some(stats_cols) = stats_columns {
@@ -176,6 +173,13 @@ fn stats_from_metadata(
             "delta.dataSkippingNumIndexedCols valid values are >=-1".to_string(),
         )));
     };
+
+    let mut min_values: HashMap<String, ColumnValueStat> =
+        HashMap::with_capacity(idx_to_iterate.len());
+    let mut max_values: HashMap<String, ColumnValueStat> =
+        HashMap::with_capacity(idx_to_iterate.len());
+    let mut null_count: HashMap<String, ColumnCountStat> =
+        HashMap::with_capacity(idx_to_iterate.len());
 
     for idx in idx_to_iterate {
         let column_descr = schema_descriptor.column(idx);

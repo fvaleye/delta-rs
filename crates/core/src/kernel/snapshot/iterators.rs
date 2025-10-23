@@ -46,7 +46,7 @@ const DV_FIELD_OFFSET: &str = "offset";
 
 static FIELD_INDICES: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
     let schema = scan_row_schema();
-    let mut indices = HashMap::new();
+    let mut indices = HashMap::with_capacity(3);
 
     let path_idx = schema.index_of(FIELD_NAME_PATH).unwrap();
     indices.insert(FIELD_NAME_PATH, path_idx);
@@ -67,7 +67,7 @@ static DV_FIELD_INDICES: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(
         panic!("Expected DataType::Struct for deletion vector field");
     };
 
-    let mut indices = HashMap::new();
+    let mut indices = HashMap::with_capacity(4);
 
     let storage_type_idx = dv_type.index_of(DV_FIELD_STORAGE_TYPE).unwrap();
     indices.insert(DV_FIELD_STORAGE_TYPE, storage_type_idx);
@@ -334,8 +334,8 @@ where
         Scalar::Timestamp(v) => Scalar::Timestamp(func(v)),
         Scalar::TimestampNtz(v) => Scalar::TimestampNtz(func(v)),
         Scalar::Struct(struct_data) => {
-            let mut fields = Vec::new();
-            let mut scalars = Vec::new();
+            let mut fields = Vec::with_capacity(struct_data.fields().len());
+            let mut scalars = Vec::with_capacity(struct_data.values().len());
 
             for (field, value) in struct_data.fields().iter().zip(struct_data.values().iter()) {
                 fields.push(field.clone());
