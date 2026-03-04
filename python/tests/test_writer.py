@@ -2678,3 +2678,42 @@ def test_write_table_with_deletion_vectors(tmp_path: pathlib.Path):
 
     dt = DeltaTable(tmp_path)
     assert dt.version() == 1, "Expected a write to have occurred!"
+
+
+@pytest.mark.pyarrow
+def test_write_date64_normalizes_to_date32(tmp_path: pathlib.Path):
+    """Date64 columns should be normalized to Date32 when writing to Delta.
+
+    Delta protocol only supports day-precision dates (Date32).
+    """
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("sales_date", pa.date64(), nullable=True),
+        ]
+    )
+    table = pa.table(
+        {
+            "id": pa.array([1, 2], type=pa.int32()),
+            "sales_date": pa.array(
+                [date(2025, 10, 20), date(2025, 11, 15)], type=pa.date64()
+            ),
+        },
+        schema=schema,
+    )
+
+    write_deltalake(tmp_path, table)
+
+    dt = DeltaTable(tmp_path)
+
+    # Delta schema should report date type, not date64
+    delta_schema = dt.schema()
+    date_field = delta_schema.fields[1]
+    assert date_field.type == PrimitiveType("date")
+
+    # Read back and verify data is intact
+    result = dt.to_pyarrow_table()
+    assert result.num_rows == 2
+    assert result.schema.field("sales_date").type == pa.date32()
