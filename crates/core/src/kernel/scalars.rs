@@ -15,7 +15,7 @@ use serde_json::Value;
 
 // ASCII set that needs to be encoded, derived from
 // PROTOCOL DOCS: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#how-to-url-encode-keys-and-string-values
-const RFC3986_PART: &AsciiSet = &CONTROLS
+const DELTA_LOG_VALUE_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ') // space
     .add(b'!')
     .add(b'"')
@@ -46,8 +46,14 @@ const RFC3986_PART: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
+const DELTA_LOG_PATH_ENCODE_SET: &AsciiSet = &DELTA_LOG_VALUE_ENCODE_SET.remove(b'/');
+
+pub(crate) fn encode_delta_log_path(path: &str) -> String {
+    utf8_percent_encode(path, DELTA_LOG_PATH_ENCODE_SET).to_string()
+}
+
 fn encode_partition_value(value: &str) -> String {
-    utf8_percent_encode(value, RFC3986_PART).to_string()
+    utf8_percent_encode(value, DELTA_LOG_VALUE_ENCODE_SET).to_string()
 }
 
 use crate::NULL_PARTITION_VALUE_DATA_PATH;

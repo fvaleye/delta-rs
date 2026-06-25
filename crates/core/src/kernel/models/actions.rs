@@ -1226,8 +1226,10 @@ impl FromStr for IsolationLevel {
 pub(crate) mod serde_path {
     use std::str::Utf8Error;
 
-    use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, percent_encode};
+    use percent_encoding::percent_decode_str;
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::kernel::scalars::encode_delta_log_path;
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
     where
@@ -1245,39 +1247,8 @@ pub(crate) mod serde_path {
         String::serialize(&encoded, serializer)
     }
 
-    pub const _DELIMITER: &str = "/";
-    /// The path delimiter as a single byte
-    pub const _DELIMITER_BYTE: u8 = _DELIMITER.as_bytes()[0];
-
-    /// Characters we want to encode.
-    const INVALID: &AsciiSet = &CONTROLS
-        // The delimiter we are reserving for internal hierarchy
-        // .add(DELIMITER_BYTE)
-        // Characters AWS recommends avoiding for object keys
-        // https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html
-        .add(b'\\')
-        .add(b'{')
-        .add(b'^')
-        .add(b'}')
-        .add(b'%')
-        .add(b'`')
-        .add(b']')
-        .add(b'"')
-        .add(b'>')
-        .add(b'[')
-        // .add(b'~')
-        .add(b'<')
-        .add(b'#')
-        .add(b'|')
-        // Characters Google Cloud Storage recommends avoiding for object names
-        // https://cloud.google.com/storage/docs/naming-objects
-        .add(b'\r')
-        .add(b'\n')
-        .add(b'*')
-        .add(b'?');
-
     fn encode_path(path: &str) -> String {
-        percent_encode(path.as_bytes(), INVALID).to_string()
+        encode_delta_log_path(path)
     }
 
     pub fn decode_path(path: &str) -> Result<String, Utf8Error> {
@@ -1289,6 +1260,35 @@ pub(crate) mod serde_path {
 mod tests {
     use super::*;
     use crate::kernel::PrimitiveType;
+
+    #[test]
+    fn test_action_paths_percent_encode_spaces() {
+        let path = "partition value/file name.parquet";
+
+        let add = Add {
+            path: path.to_string(),
+            ..Default::default()
+        };
+        let remove = Remove {
+            path: path.to_string(),
+            ..Default::default()
+        };
+        let cdc = AddCDCFile {
+            path: path.to_string(),
+            ..Default::default()
+        };
+
+        for action in [
+            serde_json::to_value(add).unwrap(),
+            serde_json::to_value(remove).unwrap(),
+            serde_json::to_value(cdc).unwrap(),
+        ] {
+            assert_eq!(
+                action["path"].as_str().unwrap(),
+                "partition%20value/file%20name.parquet"
+            );
+        }
+    }
 
     #[test]
     fn test_primitive() {
