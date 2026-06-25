@@ -419,24 +419,18 @@ impl<'a> ConflictChecker<'a> {
     /// Asserts that the client is up to date with the protocol and is allowed
     /// to read and write against the protocol set by the committed transaction.
     fn check_protocol_compatibility(&self) -> Result<(), CommitConflictError> {
+        let current_log_data = self.txn_info.read_snapshot.log_data();
+        let current_protocol = current_log_data.protocol();
         for p in self.winning_commit_summary.protocol() {
             let (win_read, curr_read) = (
                 p.min_reader_version(),
-                self.txn_info
-                    .read_snapshot
-                    .log_data()
-                    .protocol()
-                    .min_reader_version(),
+                current_protocol.min_reader_version(),
             );
             let (win_write, curr_write) = (
                 p.min_writer_version(),
-                self.txn_info
-                    .read_snapshot
-                    .log_data()
-                    .protocol()
-                    .min_writer_version(),
+                current_protocol.min_writer_version(),
             );
-            if curr_read < win_read || win_write < curr_write {
+            if &p != current_protocol {
                 return Err(CommitConflictError::ProtocolChanged(format!(
                     "required read/write {win_read}/{win_write}, current read/write {curr_read}/{curr_write}"
                 )));
@@ -886,6 +880,52 @@ mod tests {
             false,
         )
         .await;
+        assert!(matches!(
+            result,
+            Err(CommitConflictError::ProtocolChanged(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "datafusion")]
+    async fn test_concurrent_writer_protocol_upgrade_conflicts() {
+        let result = execute_test(
+            None,
+            None,
+            vec![ActionFactory::protocol(Some(1), Some(7), None::<Vec<_>>, None::<Vec<_>>).into()],
+            vec![],
+            false,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CommitConflictError::ProtocolChanged(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "datafusion")]
+    async fn test_concurrent_protocol_feature_change_conflicts() {
+        let setup = vec![
+            ActionFactory::protocol(
+                Some(1),
+                Some(7),
+                None::<Vec<_>>,
+                Some(Vec::<delta_kernel::table_features::TableFeature>::new()),
+            )
+            .into(),
+            ActionFactory::metadata(TestSchemas::simple(), None::<Vec<&str>>, None).into(),
+        ];
+        let concurrent = ActionFactory::protocol(
+            Some(1),
+            Some(7),
+            None::<Vec<_>>,
+            Some(vec![delta_kernel::table_features::TableFeature::AppendOnly]),
+        )
+        .into();
+        let result = execute_test(Some(setup), None, vec![concurrent], vec![], false).await;
+
         assert!(matches!(
             result,
             Err(CommitConflictError::ProtocolChanged(_))
