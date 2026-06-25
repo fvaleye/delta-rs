@@ -16,6 +16,7 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
 };
@@ -55,7 +56,7 @@ use datafusion_physical_expr_adapter::{
     PhysicalExprAdapterFactory,
 };
 use delta_kernel::{
-    Engine, Expression, engine::arrow_data::ArrowEngineData, expressions::StructData,
+    Engine, ExpressionRef, engine::arrow_data::ArrowEngineData, expressions::StructData,
     scan::ScanMetadata, table_features::TableFeature,
 };
 use futures::{Stream, TryStreamExt as _, future::ready};
@@ -90,10 +91,85 @@ type PublicFileIdMap = HashMap<String, String>;
 
 struct ReplayedScanFiles {
     files: Vec<ScanFileContext>,
-    transforms: HashMap<String, Arc<Expression>>,
+    transforms: FileTransforms,
     dvs: DashMap<String, Vec<bool>>,
     public_file_ids: PublicFileIdMap,
     metrics: ExecutionPlanMetricsSet,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileTransforms {
+    transform_indexes: Vec<Option<NonZeroUsize>>,
+    transforms: Vec<ExpressionRef>,
+}
+
+impl FileTransforms {
+    fn from_files(files: &mut [ScanFileContext]) -> Self {
+        Self::from_iter(files.iter_mut().map(|file| file.transform.take()))
+    }
+
+    fn from_iter(transforms: impl IntoIterator<Item = Option<ExpressionRef>>) -> Self {
+        let mut transform_indexes = Vec::new();
+        let mut unique_transforms = Vec::new();
+        let mut transform_key_indexes: HashMap<String, usize> = HashMap::new();
+
+        for (file_index, transform) in transforms.into_iter().enumerate() {
+            let Some(transform) = transform else {
+                continue;
+            };
+
+            let transform_index = match serde_json::to_string(transform.as_ref()) {
+                Ok(key) => {
+                    if let Some(transform_index) = transform_key_indexes.get(&key) {
+                        *transform_index
+                    } else {
+                        let transform_index = unique_transforms.len();
+                        transform_key_indexes.insert(key, transform_index);
+                        unique_transforms.push(transform);
+                        transform_index
+                    }
+                }
+                Err(_) => {
+                    let transform_index = unique_transforms.len();
+                    unique_transforms.push(transform);
+                    transform_index
+                }
+            };
+
+            if transform_indexes.len() <= file_index {
+                transform_indexes.resize(file_index + 1, None);
+            }
+            transform_indexes[file_index] = NonZeroUsize::new(transform_index + 1);
+        }
+
+        Self {
+            transform_indexes,
+            transforms: unique_transforms,
+        }
+    }
+
+    fn get(&self, file_id: &str) -> Result<Option<ExpressionRef>> {
+        if self.transforms.is_empty() {
+            return Ok(None);
+        }
+
+        let file_index = file_id.parse::<usize>().map_err(|err| {
+            internal_datafusion_err!(
+                "invalid internal file id '{file_id}' for transform lookup: {err}"
+            )
+        })?;
+        Ok(self
+            .transform_indexes
+            .get(file_index)
+            .and_then(|transform_index| {
+                transform_index.map(|idx| self.transforms[idx.get() - 1].clone())
+            }))
+    }
+
+    #[cfg(test)]
+    fn unique_transform_count(&self) -> usize {
+        self.transforms.len()
+    }
 }
 
 pub(super) async fn execution_plan(
@@ -328,15 +404,7 @@ async fn replay_files(
         }
     }
 
-    let transforms: HashMap<_, _> = files
-        .iter_mut()
-        .enumerate()
-        .flat_map(|(file_index, file)| {
-            file.transform
-                .take()
-                .map(|t| (compact_internal_file_id(file_index), t))
-        })
-        .collect();
+    let transforms = FileTransforms::from_files(&mut files);
 
     let dv_stream = stream.dv_stream.build();
     let dvs_by_url: HashMap<_, _> = dv_stream
@@ -852,6 +920,8 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use url::Url;
 
+    use delta_kernel::{Expression, ExpressionRef, expressions::Scalar};
+
     use crate::{
         assert_batches_sorted_eq,
         delta_datafusion::{
@@ -865,6 +935,43 @@ mod tests {
     };
 
     use super::{plan::build_parquet_predicate_schema, *};
+
+    fn literal_transform(value: i32) -> ExpressionRef {
+        Arc::new(Expression::Literal(Scalar::Integer(value)))
+    }
+
+    #[test]
+    fn test_file_transforms_deduplicate_equal_expressions() -> TestResult {
+        let transform_a = literal_transform(1);
+        let transform_b = literal_transform(1);
+        let transform_c = literal_transform(2);
+
+        let transforms = FileTransforms::from_iter([
+            Some(transform_a),
+            Some(transform_b),
+            None,
+            Some(transform_c.clone()),
+        ]);
+
+        assert_eq!(transforms.unique_transform_count(), 2);
+        let first = transforms.get("0")?.expect("first transform");
+        let second = transforms.get("1")?.expect("second transform");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(transforms.get("2")?.is_none());
+        assert_eq!(transforms.get("3")?.unwrap().as_ref(), transform_c.as_ref());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_transforms_keep_empty_pool_for_untransformed_files() -> TestResult {
+        let transforms = FileTransforms::from_iter([None, None, None]);
+
+        assert_eq!(transforms.unique_transform_count(), 0);
+        assert!(transforms.get("not-a-number")?.is_none());
+
+        Ok(())
+    }
 
     #[test]
     fn test_partitioned_files_to_file_groups_respects_dictionary_cardinality_limit() {

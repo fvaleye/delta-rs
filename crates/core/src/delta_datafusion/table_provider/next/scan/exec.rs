@@ -32,9 +32,9 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory,
 };
+use delta_kernel::EvaluationHandler;
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::table_features::TableFeature;
-use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::{Stream, StreamExt};
 
 use super::plan::KernelScanPlan;
@@ -113,7 +113,7 @@ pub struct DeltaScanExec {
     /// Execution plan yielding the raw data read from data files.
     input: Arc<dyn ExecutionPlan>,
     /// Transforms to be applied to data eminating from individual files
-    transforms: Arc<HashMap<String, ExpressionRef>>,
+    transforms: Arc<super::FileTransforms>,
     /// Selection vectors to be applied to data read from individual files
     selection_vectors: Arc<DashMap<String, Vec<bool>>>,
     /// Public file paths keyed by compact scan file id.
@@ -154,7 +154,7 @@ impl DeltaScanExec {
     pub(crate) fn new(
         scan_plan: Arc<KernelScanPlan>,
         input: Arc<dyn ExecutionPlan>,
-        transforms: Arc<HashMap<String, ExpressionRef>>,
+        transforms: Arc<super::FileTransforms>,
         selection_vectors: Arc<DashMap<String, Vec<bool>>>,
         public_file_ids: Arc<super::PublicFileIdMap>,
         partition_stats: HashMap<String, ColumnStatistics>,
@@ -481,7 +481,7 @@ struct DeltaScanStream {
     /// Execution metrics
     baseline_metrics: BaselineMetrics,
     /// Transforms to be applied to data read from individual files
-    transforms: Arc<HashMap<String, ExpressionRef>>,
+    transforms: Arc<super::FileTransforms>,
     /// Selection vectors to be applied to data read from individual files
     selection_vectors: Arc<DashMap<String, Vec<bool>>>,
     /// Public file paths keyed by compact scan file id.
@@ -551,7 +551,7 @@ impl DeltaScanStream {
 
         batch.remove_column(file_id_idx);
 
-        let result = if let Some(transform) = self.transforms.get(&file_id) {
+        let result = if let Some(transform) = self.transforms.get(&file_id)? {
             let evaluator = ARROW_HANDLER
                 .new_expression_evaluator(
                     self.scan_plan.scan.physical_schema().clone(),
@@ -1746,7 +1746,7 @@ mod tests {
             kernel_type,
             input,
             baseline_metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
-            transforms: Arc::new(HashMap::new()),
+            transforms: Arc::new(super::super::FileTransforms::default()),
             selection_vectors,
             public_file_ids: Arc::new(public_file_ids),
             input_file_id_column,

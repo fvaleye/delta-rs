@@ -16,7 +16,7 @@ use arrow_schema::{FieldRef, Fields, Schema};
 use dashmap::DashMap;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::error::{DataFusionError, Result};
-use datafusion::common::{HashMap, internal_datafusion_err, stats::Precision};
+use datafusion::common::{internal_datafusion_err, stats::Precision};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{
@@ -29,8 +29,8 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, Statistics,
 };
+use delta_kernel::EvaluationHandler;
 use delta_kernel::schema::{Schema as KernelSchema, SchemaRef as KernelSchemaRef};
-use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::Stream;
 use itertools::Itertools as _;
 use tracing::debug;
@@ -66,7 +66,7 @@ pub(crate) struct DeltaScanMetaExec {
     /// Execution plan yielding the raw data read from data files.
     input: Vec<VecDeque<(String, usize)>>,
     /// Transforms to be applied to data eminating from individual files
-    transforms: Arc<HashMap<String, ExpressionRef>>,
+    transforms: Arc<super::FileTransforms>,
     /// Deletion vectors for the table
     selection_vectors: Arc<DashMap<String, Vec<bool>>>,
     /// Public file paths keyed by compact scan file id.
@@ -126,7 +126,7 @@ impl DeltaScanMetaExec {
     pub(super) fn new(
         scan_plan: Arc<KernelScanPlan>,
         input: Vec<VecDeque<(String, usize)>>,
-        transforms: Arc<HashMap<String, ExpressionRef>>,
+        transforms: Arc<super::FileTransforms>,
         selection_vectors: Arc<DashMap<String, Vec<bool>>>,
         public_file_ids: Arc<super::PublicFileIdMap>,
         file_id_field: Option<FieldRef>,
@@ -331,7 +331,7 @@ struct DeltaScanMetaStream {
     /// Count of file batches where short deletion-vector masks required padding.
     dv_short_mask_padded_files_total: Count,
     /// Transforms to be applied to data read from individual files
-    transforms: Arc<HashMap<String, ExpressionRef>>,
+    transforms: Arc<super::FileTransforms>,
     /// Selection vectors to be applied to data read from individual files
     selection_vectors: Arc<DashMap<String, Vec<bool>>>,
     /// Public file paths keyed by compact scan file id.
@@ -386,7 +386,7 @@ impl DeltaScanMetaStream {
         {
             // Empty projection: the kernel transform can't build a zero-field struct, keep as-is.
             batch
-        } else if let Some(transform) = self.transforms.get(&file_id) {
+        } else if let Some(transform) = self.transforms.get(&file_id)? {
             let evaluator = ARROW_HANDLER
                 .new_expression_evaluator(
                     EMPTY_KERNEL_SCHEMA.clone(),
