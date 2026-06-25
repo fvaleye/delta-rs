@@ -360,6 +360,14 @@ impl DeltaWriter<RecordBatch> for RecordBatchWriter {
             values
         };
 
+        if mode == WriteMode::Default && values.schema() != self.arrow_schema_ref {
+            return Err(DeltaWriterError::SchemaMismatch {
+                record_batch_schema: values.schema(),
+                expected_schema: self.arrow_schema_ref.clone(),
+            }
+            .into());
+        }
+
         for result in self.divide_by_partition_values(&values)? {
             let maybe_evolved_schema = self
                 .write_partition(result.record_batch, &result.partition_values, mode)
@@ -1020,6 +1028,47 @@ mod tests {
                     }
                 }
             };
+        }
+
+        #[tokio::test]
+        async fn test_write_mismatched_schema_with_partition_columns() {
+            let table_dir = tempfile::tempdir().unwrap();
+            let table_path = table_dir.path().to_str().unwrap();
+
+            let batch = get_record_batch(None, false);
+            let partition_cols = vec!["id".to_string()];
+            let table = create_initialized_table(table_path, &partition_cols).await;
+            let mut writer = RecordBatchWriter::for_table(&table).unwrap();
+
+            writer.write(batch).await.unwrap();
+            let adds = writer.flush().await.unwrap();
+            assert_eq!(adds.len(), 2);
+
+            let second_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new("value", DataType::Int32, true),
+                Field::new("modified", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let second_batch = RecordBatch::try_new(
+                second_schema,
+                vec![
+                    Arc::new(StringArray::from(vec![Some("A"), Some("B")])),
+                    Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("2021-02-02"),
+                        Some("2021-02-01"),
+                    ])),
+                    Arc::new(StringArray::from(vec![Some("will"), Some("robert")])),
+                ],
+            )
+            .unwrap();
+
+            let result = writer.write(second_batch).await;
+            assert!(matches!(
+                result,
+                Err(DeltaTableError::SchemaMismatch { .. })
+            ));
         }
 
         #[tokio::test]
