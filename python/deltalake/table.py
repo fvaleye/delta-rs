@@ -2204,12 +2204,10 @@ class TableOptimizer:
         """
         Compacts small files to reduce read overhead.
 
-        This operation is idempotent; if run twice on the same table (assuming it has
-        not been updated) it will do nothing the second time.
-
         Compaction keeps file order within each partition.
 
-        The target size is approximate.
+        The target size is approximate, so a later run can still find additional
+        files to compact even when the table has not been updated.
 
         If this operation runs with any operation other than append, it fails.
 
