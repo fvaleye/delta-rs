@@ -343,6 +343,9 @@ impl DeltaTable {
 
     /// Returns a URIs for all active files present in the current table version.
     pub fn get_file_uris(&self) -> DeltaResult<impl Iterator<Item = String> + '_> {
+        // Decoding a local table root is the costly part of `to_uri`, so do it once, not per file.
+        let local_root_prefix = (self.log_store.root_url().scheme() == "file")
+            .then(|| self.log_store.to_uri(&Path::default()));
         Ok(self
             .state
             .as_ref()
@@ -350,7 +353,10 @@ impl DeltaTable {
             .log_data()
             .into_iter()
             .map(|add| add.object_store_path())
-            .map(|path| self.log_store.to_uri(&path)))
+            .map(move |path| match &local_root_prefix {
+                Some(prefix) => format!("{prefix}{path}"),
+                None => self.log_store.to_uri(&path),
+            }))
     }
 
     /// Returns the currently loaded state snapshot.
