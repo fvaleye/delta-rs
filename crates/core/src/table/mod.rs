@@ -191,6 +191,13 @@ impl DeltaTable {
         self.update_incremental(None).await
     }
 
+    /// Load the latest state without materializing the active files, for callers such as blind
+    /// appends that do not read them.
+    pub async fn load_without_files(&mut self) -> Result<(), DeltaTableError> {
+        self.state = Some(DeltaTableState::try_new_without_files(&self.log_store, None).await?);
+        Ok(())
+    }
+
     /// Updates the DeltaTable to the most recent state committed to the transaction log by
     /// loading the last checkpoint and incrementally applying each version since.
     pub async fn update_state(&mut self) -> Result<(), DeltaTableError> {

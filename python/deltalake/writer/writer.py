@@ -106,7 +106,10 @@ def write_deltalake(
         commit_properties: properties of the transaction commit. If None, default values are used.
         post_commithook_properties: properties for the post commit hook. If None, default values are used.
     """
-    table, table_uri = try_get_table_and_table_uri(table_or_uri, storage_options)
+    # An append only needs protocol, metadata and the log tail, not every active file.
+    table, table_uri = try_get_table_and_table_uri(
+        table_or_uri, storage_options, without_files=mode == "append"
+    )
     if table is not None:
         storage_options = table._storage_options or {}
         storage_options.update(storage_options or {})

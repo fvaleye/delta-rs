@@ -86,6 +86,7 @@ class RawDeltaTable:
         table_uri: str,
         version: int | None,
         storage_options: dict[str, str] | None,
+        without_files: bool = False,
     ) -> None: ...
     @staticmethod
     def get_table_uri_from_data_catalog(

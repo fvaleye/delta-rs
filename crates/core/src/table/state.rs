@@ -49,6 +49,16 @@ impl DeltaTableState {
         Ok(Self { snapshot })
     }
 
+    /// Create a DeltaTableState without materializing the active files
+    pub async fn try_new_without_files(
+        log_store: &dyn LogStore,
+        version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        log_store.refresh().await?;
+        let snapshot = EagerSnapshot::try_new_without_files(log_store, version).await?;
+        Ok(Self { snapshot })
+    }
+
     /// Return table version
     pub fn version(&self) -> Version {
         self.snapshot.version()

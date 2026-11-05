@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 def try_get_table_and_table_uri(
     table_or_uri: str | Path | DeltaTable,
     storage_options: dict[str, str] | None = None,
+    without_files: bool = False,
 ) -> tuple[DeltaTable | None, str]:
     """Parses the `table_or_uri`.
     Raises [ValueError] If `table_or_uri` is not of type str, Path or DeltaTable.
@@ -19,6 +20,7 @@ def try_get_table_and_table_uri(
     Args:
         table_or_uri: URI of a table or a DeltaTable object.
         storage_options: Options passed to the native delta filesystem.
+        without_files: Skip materializing the active files when loading from a URI.
 
     Returns:
         (DeltaTable object, URI of the table)
@@ -29,7 +31,7 @@ def try_get_table_and_table_uri(
         raise ValueError("table_or_uri must be a str, Path or DeltaTable")
 
     if isinstance(table_or_uri, (str, Path)):
-        table = try_get_deltatable(table_or_uri, storage_options)
+        table = try_get_deltatable(table_or_uri, storage_options, without_files)
         table_uri = str(table_or_uri)
     else:
         table = table_or_uri
@@ -39,11 +41,22 @@ def try_get_table_and_table_uri(
 
 
 def try_get_deltatable(
-    table_uri: str | Path, storage_options: dict[str, str] | None
+    table_uri: str | Path,
+    storage_options: dict[str, str] | None,
+    without_files: bool = False,
 ) -> DeltaTable | None:
+    from deltalake._internal import RawDeltaTable
     from deltalake.table import DeltaTable
 
     try:
-        return DeltaTable(table_uri, storage_options=storage_options)
+        if not without_files:
+            return DeltaTable(table_uri, storage_options=storage_options)
+        # The public constructor ignores `without_files`, so build the lazy table directly.
+        table = DeltaTable.__new__(DeltaTable)
+        table._storage_options = storage_options
+        table._table = RawDeltaTable(
+            str(table_uri), storage_options=storage_options, without_files=True
+        )
+        return table
     except TableNotFoundError:
         return None

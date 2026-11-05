@@ -434,12 +434,13 @@ impl RawDeltaTable {
 #[pymethods]
 impl RawDeltaTable {
     #[new]
-    #[pyo3(signature = (table_uri, version = None, storage_options = None))]
+    #[pyo3(signature = (table_uri, version = None, storage_options = None, without_files = false))]
     fn new(
         py: Python,
         table_uri: &str,
         version: Option<Version>,
         storage_options: Option<HashMap<String, String>>,
+        without_files: bool,
     ) -> PyResult<Self> {
         py.detach(|| {
             let table_url = deltalake::table::builder::parse_table_uri(table_uri)
@@ -455,7 +456,14 @@ impl RawDeltaTable {
                 builder = builder.with_version(version)
             }
 
-            let table = rt().block_on(builder.load()).map_err(PythonError::from)?;
+            let table = if without_files && version.is_none() {
+                let mut table = builder.build().map_err(PythonError::from)?;
+                rt().block_on(table.load_without_files())
+                    .map_err(PythonError::from)?;
+                table
+            } else {
+                rt().block_on(builder.load()).map_err(PythonError::from)?
+            };
             Ok(RawDeltaTable {
                 _config: FsConfig {
                     root_url: table.table_url().clone(),

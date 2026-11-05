@@ -1338,6 +1338,18 @@ impl EagerSnapshot {
         Self::try_new_with_snapshot(log_store, snapshot.into()).await
     }
 
+    /// Create an [`EagerSnapshot`] without materializing active files. Replay happens on demand,
+    /// so callers that only need protocol, metadata and the log tail avoid an O(files) load.
+    pub async fn try_new_without_files(
+        log_store: &dyn LogStore,
+        version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let snapshot = Snapshot::try_new(log_store, version).await?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+        })
+    }
+
     /// Materialize active-file metadata through kernel replay; this does not set a kernel scan mode.
     /// Direct [`Snapshot`] construction remains lazy, while this constructor and
     /// [`resolve_snapshot`] require materialized files, including for metadata-only callers.

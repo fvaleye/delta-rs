@@ -885,6 +885,45 @@ mod tests {
         assert_eq!(parquet_columns, physical_names);
     }
 
+    /// An append on a table loaded without files must not materialize them, and must commit the
+    /// same files a fully loaded table would see.
+    #[tokio::test]
+    async fn test_append_on_table_loaded_without_files() {
+        let batch = get_record_batch(None, false);
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(get_delta_schema().fields().cloned())
+            .await
+            .unwrap();
+        let table = table.write(vec![batch.clone()]).await.unwrap();
+        assert_eq!(table.version(), Some(1));
+
+        let mut lazy = DeltaTable::new(table.log_store());
+        lazy.load_without_files().await.unwrap();
+        let lazy_snapshot = lazy.snapshot().unwrap().snapshot().snapshot();
+        assert!(!lazy_snapshot.has_materialized_files_for_test());
+
+        let lazy = lazy
+            .write(vec![batch.clone()])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(lazy.version(), Some(2));
+        assert!(
+            !lazy
+                .snapshot()
+                .unwrap()
+                .snapshot()
+                .snapshot()
+                .has_materialized_files_for_test()
+        );
+
+        let mut full = DeltaTable::new(table.log_store());
+        full.load().await.unwrap();
+        assert_eq!(full.version(), Some(2));
+        assert_eq!(full.snapshot().unwrap().log_data().num_files(), 2);
+    }
+
     #[tokio::test]
     async fn test_create_write() {
         let table_schema = get_delta_schema();
