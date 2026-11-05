@@ -5,13 +5,15 @@ use arrow::datatypes::Schema;
 use arrow_array::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::ToDFSchema;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, col, lit, when};
 use datafusion::physical_expr::expressions::col as physical_col;
+use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::repartition::BatchPartitioner;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    ExecutionPlan, ExecutionPlanProperties, Partitioning, SendableRecordBatchStream,
-    execute_stream_partitioned,
+    ExecutionPlan, SendableRecordBatchStream, execute_stream_partitioned,
 };
 use delta_kernel::table_configuration::TableConfiguration;
 use futures::StreamExt as _;
@@ -222,6 +224,9 @@ mod tests {
 }
 
 const DEFAULT_WRITER_BATCH_CHANNEL_SIZE: usize = 10;
+
+/// Batches queued per writer stream between the partition split and its writer.
+const PARTITION_CHANNEL_CAPACITY: usize = 2;
 
 /// Try parse a positive `usize` knob, falling back to `default`
 fn parse_positive_usize(raw: Option<&str>, default: usize) -> usize {
@@ -718,31 +723,79 @@ pub(crate) async fn write_streams_with_capacity(
     ))
 }
 
-/// Hash repartitions the plan by partition columns so each stream
-/// writes to disjoint Delta partitions.
-/// The output partition count is capped by `DELTARS_MAX_CONCURRENT_WRITERS`
-/// Returns the plan unchanged if there is only a single stream.
-fn repartition_by_partition_columns(
+/// Executes the plan as streams that write disjoint Delta partitions: batches are
+/// hash split by the partition columns and routed to one bounded channel per stream.
+/// The stream count is capped by `DELTARS_MAX_CONCURRENT_WRITERS`, and a single input
+/// stream is returned unchanged.
+///
+/// DataFusion's `RepartitionExec` is not used here: its queues only apply backpressure
+/// once every output is non-empty, so a skewed or single partition lets the producers
+/// copy the whole input into memory ahead of the writers.
+fn partitioned_streams(
     plan: Arc<dyn ExecutionPlan>,
     partition_columns: &[String],
-) -> DeltaResult<Arc<dyn ExecutionPlan>> {
-    let original_count = plan.output_partitioning().partition_count();
-
-    if original_count <= 1 {
-        return Ok(plan);
+    session: &dyn Session,
+) -> DeltaResult<Vec<SendableRecordBatchStream>> {
+    let inputs = execute_stream_partitioned(plan.clone(), session.task_ctx())?;
+    if inputs.len() <= 1 {
+        return Ok(inputs);
     }
 
-    let num_partitions = original_count.min(max_concurrent_writers());
-
+    let num_outputs = inputs.len().min(max_concurrent_writers());
     let schema = plan.schema();
     let hash_exprs = partition_columns
         .iter()
         .map(|name| physical_col(name, &schema).map(|e| e as _))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Arc::new(RepartitionExec::try_new(
-        plan,
-        Partitioning::Hash(hash_exprs, num_partitions),
-    )?))
+
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_outputs)
+        .map(|_| {
+            mpsc::channel::<datafusion::error::Result<RecordBatch>>(PARTITION_CHANNEL_CAPACITY)
+        })
+        .unzip();
+    for mut input in inputs {
+        let senders = senders.clone();
+        let mut partitioner = BatchPartitioner::new_hash_partitioner(
+            hash_exprs.clone(),
+            num_outputs,
+            Time::default(),
+        )?;
+        tokio::spawn(async move {
+            while let Some(batch) = input.next().await {
+                let routed = batch.and_then(|batch| {
+                    partitioner
+                        .partition_iter(batch)?
+                        .collect::<datafusion::error::Result<Vec<_>>>()
+                });
+                match routed {
+                    Ok(parts) => {
+                        for (output, part) in parts {
+                            if senders[output].send(Ok(part)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let err = Arc::new(err);
+                        for sender in &senders {
+                            let _ = sender.send(Err(DataFusionError::Shared(err.clone()))).await;
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(receivers
+        .into_iter()
+        .map(|rx| {
+            let batches = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|batch| (batch, rx))
+            });
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), batches)) as _
+        })
+        .collect())
 }
 
 async fn write_data_plan(
@@ -783,8 +836,7 @@ async fn write_data_plan(
         return Ok((actions, metrics));
     }
 
-    let plan = repartition_by_partition_columns(plan, &partition_columns)?;
-    let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+    let partition_streams = partitioned_streams(plan, &partition_columns, session)?;
     let scan_start = std::time::Instant::now();
 
     // Split the global in-flight batch budget across the concurrent per-partition
@@ -1066,8 +1118,7 @@ async fn write_cdc_plan(
         return Ok((actions, metrics));
     }
 
-    let plan = repartition_by_partition_columns(plan, &partition_columns)?;
-    let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+    let partition_streams = partitioned_streams(plan, &partition_columns, session)?;
     let scan_start = std::time::Instant::now();
     let mut join_set = JoinSet::new();
 
