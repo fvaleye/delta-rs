@@ -73,7 +73,7 @@
 //!       │                               │
 //!       └───────────────────────────────┘
 //!</pre>
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -81,6 +81,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use conflict_checker::ConflictChecker;
 use delta_kernel::table_properties::TableProperties;
+use futures::TryStreamExt as _;
 use futures::future::BoxFuture;
 use object_store::Error as ObjectStoreError;
 use object_store::ObjectStoreExt as _;
@@ -1047,12 +1048,42 @@ pub struct PostCommit {
 }
 
 impl PostCommit {
+    /// Whether this commit only added files that are not yet active in `snapshot`, so that
+    /// the files cached in `snapshot` stay valid. The commit loop brings `snapshot` to the
+    /// version right before this commit.
+    async fn adds_only_new_files(&self, snapshot: &EagerSnapshot) -> DeltaResult<bool> {
+        let mut added_paths = HashSet::new();
+        for action in &self.data.actions {
+            match action {
+                Action::Add(add) => {
+                    added_paths.insert(add.path.as_str());
+                }
+                Action::CommitInfo(_) | Action::Txn(_) => {}
+                _ => return Ok(false),
+            }
+        }
+        // Re-adding an active path replaces it, which the cached files cannot express.
+        let mut active = snapshot.file_views(&self.log_store, None);
+        while let Some(file) = active.try_next().await? {
+            if added_paths.contains(file.path().as_ref()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Runs the post commit activities
     async fn run_post_commit_hook(&self) -> DeltaResult<(DeltaTableState, PostCommitMetrics)> {
         if let Some(table) = &self.table_data {
             let mut snapshot = table.eager_snapshot().clone();
             if self.version != snapshot.version() {
-                snapshot.update(&self.log_store, Some(self.version)).await?;
+                if self.adds_only_new_files(&snapshot).await? {
+                    snapshot
+                        .update_with_added_files(&self.log_store, self.version)
+                        .await?;
+                } else {
+                    snapshot.update(&self.log_store, Some(self.version)).await?;
+                }
             }
 
             let mut state = DeltaTableState { snapshot };

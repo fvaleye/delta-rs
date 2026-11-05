@@ -294,6 +294,15 @@ impl Snapshot {
         engine: Arc<dyn Engine>,
         target_version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
+        self.update_inner(engine, target_version, false).await
+    }
+
+    async fn update_inner(
+        self: Arc<Self>,
+        engine: Arc<dyn Engine>,
+        target_version: Option<Version>,
+        only_files_added: bool,
+    ) -> DeltaResult<Arc<Self>> {
         let current_version = self.version();
         if let Some(version) = target_version {
             if version < current_version {
@@ -337,7 +346,11 @@ impl Snapshot {
             match self.materialized_files() {
                 Some(materialized_files) => {
                     snapshot
-                        .materialize_files_with_engine(engine, Some(materialized_files))
+                        .materialize_files_with_engine(
+                            engine,
+                            Some(materialized_files),
+                            only_files_added,
+                        )
                         .await
                 }
                 None => Ok(snapshot),
@@ -381,7 +394,7 @@ impl Snapshot {
         match self.materialized_files() {
             Some(materialized_files) => {
                 snapshot
-                    .materialize_files_with_engine(engine, Some(materialized_files))
+                    .materialize_files_with_engine(engine, Some(materialized_files), false)
                     .await
             }
             None => Ok(snapshot),
@@ -463,7 +476,7 @@ impl Snapshot {
             return Ok(self);
         }
 
-        self.materialize_files_with_engine(log_store.engine(), None)
+        self.materialize_files_with_engine(log_store.engine(), None, false)
             .await
     }
 
@@ -898,12 +911,34 @@ impl Snapshot {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         materialized_seed: Option<&Arc<MaterializedFiles>>,
+        only_files_added: bool,
     ) -> DeltaResult<Arc<Self>> {
         if materialized_seed.is_none() && self.materialized_files().is_some() {
             return Ok(self);
         }
 
         let batches = match materialized_seed.and_then(|seed| seed.full_table_seed()) {
+            // Added files leave the cached ones valid, unless a newer checkpoint makes the
+            // kernel replay the whole table.
+            Some(seed)
+                if only_files_added
+                    && seed.existing_predicate.is_none()
+                    && !self.checkpoint_version().is_some_and(|v| v > seed.version) =>
+            {
+                // New files first, like the kernel emits them when it replays the table.
+                let mut batches: Vec<_> = self
+                    .files_from_preserving_raw(
+                        engine,
+                        None,
+                        seed.version,
+                        Box::new(std::iter::empty()),
+                        None,
+                    )
+                    .try_collect()
+                    .await?;
+                batches.extend(seed);
+                batches
+            }
             Some(materialized_seed) => {
                 let (existing_version, existing_data, existing_predicate) =
                     materialized_seed.into_parts();
@@ -1361,6 +1396,25 @@ impl EagerSnapshot {
         log_store: &dyn LogStore,
         target_version: Option<Version>,
     ) -> DeltaResult<()> {
+        self.update_inner(log_store, target_version, false).await
+    }
+
+    /// Update the snapshot to the version of a commit that only added files
+    pub(crate) async fn update_with_added_files(
+        &mut self,
+        log_store: &dyn LogStore,
+        target_version: Version,
+    ) -> DeltaResult<()> {
+        self.update_inner(log_store, Some(target_version), true)
+            .await
+    }
+
+    async fn update_inner(
+        &mut self,
+        log_store: &dyn LogStore,
+        target_version: Option<Version>,
+        only_files_added: bool,
+    ) -> DeltaResult<()> {
         // Catalog-managed tables: the incremental (filesystem-only) update path below can't see
         // ratified-but-unpublished commits, and the catalog — not the filesystem — decides the
         // latest version. Rebuild from the catalog-provided log tail instead.
@@ -1374,7 +1428,7 @@ impl EagerSnapshot {
         let previous_snapshot = self.snapshot.clone();
         let updated_snapshot = previous_snapshot
             .clone()
-            .update(log_store.engine(), target_version)
+            .update_inner(log_store.engine(), target_version, only_files_added)
             .await?;
         if Arc::ptr_eq(&updated_snapshot, &previous_snapshot) {
             return Ok(());
@@ -1551,12 +1605,13 @@ mod tests {
             FilterOp, FilterValue, conjunction_to_kernel_predicate, dnf_to_kernel_predicate,
         },
         kernel::transaction::CommitData,
-        kernel::transaction::{CommitBuilder, TableReference},
+        kernel::transaction::{CommitBuilder, FinalizedCommit, TableReference},
         kernel::{Action, DataType, PrimitiveType, StructField, StructType},
         operations::create::CreateBuilder,
         protocol::{DeltaOperation, SaveMode},
         test_utils::{
-            TestResult, TestTables, assert_batches_sorted_eq, make_test_add,
+            TestResult, TestTables, add_as_remove, assert_batches_sorted_eq, file_paths_from,
+            make_test_add,
             object_store::{
                 drain_recorded_object_store_operations as drain_recorded_ops, recording_log_store,
             },
@@ -1640,7 +1695,14 @@ mod tests {
     }
 
     async fn append_test_add(table: &mut DeltaTable, path: &str) -> DeltaResult<Version> {
-        let version = CommitBuilder::default()
+        let version = commit_test_add(table, path).await?.version();
+        table.update_state().await?;
+        Ok(version)
+    }
+
+    /// Commit a single add, returning the post commit table state.
+    async fn commit_test_add(table: &DeltaTable, path: &str) -> DeltaResult<FinalizedCommit> {
+        CommitBuilder::default()
             .with_actions(vec![Action::Add(make_test_add(path, &[], 0))])
             .build(
                 table
@@ -1654,10 +1716,7 @@ mod tests {
                     predicate: None,
                 },
             )
-            .await?
-            .version();
-        table.update_state().await?;
-        Ok(version)
+            .await
     }
 
     async fn append_test_add_with_stats(
@@ -3287,6 +3346,112 @@ mod tests {
             ]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_eager_snapshot_update_with_added_files_falls_back_on_newer_checkpoint()
+    -> TestResult {
+        let (_dir, mut table) = checkpoint_rebase_table().await?;
+        let log_store = table.log_store();
+        let mut snapshot = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+
+        let version = append_test_add(&mut table, "part-00002.snappy.parquet").await?;
+        checkpoints::create_checkpoint(&table).await?;
+        snapshot
+            .update_with_added_files(log_store.as_ref(), version)
+            .await?;
+
+        assert_eq!(snapshot.snapshot.checkpoint_version(), Some(version));
+        assert_eq!(
+            eager_file_paths(&snapshot, log_store.as_ref()).await?,
+            vec![
+                "part-00002.snappy.parquet",
+                "part-00001.snappy.parquet",
+                "part-00000.snappy.parquet",
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_post_commit_append_reuses_cached_files() -> TestResult {
+        let (_dir, table) = checkpoint_rebase_table().await?;
+        let log_store = table.log_store();
+        let cached = table
+            .snapshot()?
+            .snapshot()
+            .snapshot
+            .materialized_files()
+            .cloned()
+            .expect("table state caches its files");
+
+        let finalized = commit_test_add(&table, "part-00002.snappy.parquet").await?;
+
+        let state = finalized.snapshot();
+        let updated = state
+            .snapshot()
+            .snapshot
+            .materialized_files()
+            .expect("post commit state caches its files");
+        let (old, new) = (cached.batches.last(), updated.batches.last());
+        assert!(Arc::ptr_eq(
+            old.expect("cached batch").column(0),
+            new.expect("updated batch").column(0)
+        ));
+        let fresh = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+        assert_eq!(
+            file_paths_from(&state, &log_store).await?,
+            eager_file_paths(&fresh, log_store.as_ref()).await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_post_commit_re_adding_active_file_matches_fresh_load() -> TestResult {
+        let (_dir, mut table) = checkpoint_rebase_table().await?;
+        let log_store = table.log_store();
+        let path = "ts=2021-01-01 00%253A00%253A00/a%2520b.parquet";
+        append_test_add(&mut table, path).await?;
+
+        let finalized = commit_test_add(&table, path).await?;
+
+        let fresh = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+        assert_eq!(
+            file_paths_from(&finalized.snapshot(), &log_store).await?,
+            eager_file_paths(&fresh, log_store.as_ref()).await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_post_commit_after_concurrent_compaction_matches_fresh_load() -> TestResult {
+        let (_dir, stale) = checkpoint_rebase_table().await?;
+        let log_store = stale.log_store();
+        let compacted = make_test_add("part-00000.snappy.parquet", &[], 0);
+        CommitBuilder::default()
+            .with_actions(vec![
+                Action::Remove(add_as_remove(&compacted, false)),
+                Action::Add(make_test_add("part-00002.snappy.parquet", &[], 0)),
+            ])
+            .build(
+                Some(stale.snapshot()? as &dyn TableReference),
+                log_store.clone(),
+                DeltaOperation::Optimize {
+                    predicate: None,
+                    target_size: 0,
+                },
+            )
+            .await?;
+
+        let finalized = commit_test_add(&stale, "part-00003.snappy.parquet").await?;
+
+        assert_eq!(finalized.version(), 4);
+        let fresh = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+        assert_eq!(
+            file_paths_from(&finalized.snapshot(), &log_store).await?,
+            eager_file_paths(&fresh, log_store.as_ref()).await?
+        );
         Ok(())
     }
 
