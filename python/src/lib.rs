@@ -2519,6 +2519,7 @@ fn scalar_to_py<'py>(value: &Scalar, py_date: &Bound<'py, PyAny>) -> PyResult<Bo
 ///
 /// Statistics are translated into inequalities. If there are null values, then
 /// they must be OR'd with is_null.
+/// Missing min/max statistics do not constrain the fragment.
 fn filestats_to_expression_next<'py>(
     py: Python<'py>,
     schema: &SchemaRef,
@@ -2597,6 +2598,7 @@ fn filestats_to_expression_next<'py>(
                 match value {
                     // TODO: Handle nested field statistics.
                     Scalar::Struct(_) => {}
+                    Scalar::Null(_) => {}
                     _ => {
                         let maybe_minimum =
                             cast_to_type(field.name(), &scalar_to_py(value, &py_date)?, schema);
@@ -2626,6 +2628,7 @@ fn filestats_to_expression_next<'py>(
                 match value {
                     // TODO: Handle nested field statistics.
                     Scalar::Struct(_) => {}
+                    Scalar::Null(_) => {}
                     _ => {
                         let maybe_maximum =
                             cast_to_type(field.name(), &scalar_to_py(value, &py_date)?, schema);

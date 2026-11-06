@@ -259,3 +259,27 @@ def test_stats_columns_after_excluded_struct(tmp_path: pathlib.Path) -> None:
     assert actions["min"][0].as_py() == {"a": 1, "b": 3}
     assert actions["max"][0].as_py() == {"a": 2, "b": 4}
     assert actions["null_count"][0].as_py() == {"a": 0, "b": 0}
+
+
+@pytest.mark.pyarrow
+@pytest.mark.parametrize(
+    "values", [[True, False, None], [1, 2, None], ["a", "b", None]]
+)
+def test_filters_keep_files_without_column_statistics(tmp_path, values):
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    data = pa.table({"id": [1, 2, 3], "value": values})
+    write_deltalake(
+        tmp_path, data, configuration={"delta.dataSkippingStatsColumns": "id"}
+    )
+    DeltaTable(tmp_path).alter.set_table_properties(
+        {"delta.dataSkippingStatsColumns": "id,value"}
+    )
+    write_deltalake(tmp_path, data, mode="append")
+
+    table = DeltaTable(tmp_path)
+    result = table.to_pyarrow_table(filters=[("value", "=", values[0])])
+    assert result.to_pydict() == {"id": [1, 1], "value": [values[0], values[0]]}
+    result = table.to_pyarrow_dataset().to_table(filter=ds.field("value").is_null())
+    assert result.to_pydict() == {"id": [3, 3], "value": [None, None]}
