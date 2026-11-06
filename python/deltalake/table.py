@@ -2409,16 +2409,19 @@ class TableAlterer:
         Enable a table feature.
 
         Args:
-            feature: Table Feature e.g. Deletion Vectors, Change Data Feed
-            allow_protocol_versions_increase: Allow the protocol to be implicitly bumped to reader 3 or writer 7
+            feature: A member of `deltalake.TableFeatures` or a list of members.
+            allow_protocol_versions_increase: Allow upgrading the protocol to reader version 3 or writer version 7.
+                If False, raise an error when the feature requires a protocol upgrade.
             commit_properties: properties of the transaction commit. If None, default values are used.
             post_commithook_properties: properties for the post commit hook. If None, default values are used.
 
         Example:
             ```python
-            from deltalake import DeltaTable
+            from deltalake import DeltaTable, TableFeatures
             dt = DeltaTable("test_table")
-            dt.alter.add_feature(TableFeatures.AppendOnly)
+            dt.alter.add_feature(
+                TableFeatures.AppendOnly, allow_protocol_versions_increase=True
+            )
             ```
 
             **Check protocol**
@@ -2618,11 +2621,16 @@ class TableAlterer:
         post_commithook_properties: PostCommitHookProperties | None = None,
     ) -> None:
         """
-        Set properties from the table.
+        Set table properties.
+
+        See [TableProperty][deltalake.TableProperty] for recognized property names and
+        the [Delta table properties reference](https://docs.delta.io/table-properties/)
+        for descriptions and defaults.
 
         Args:
-            properties: properties which set
-            raise_if_not_exists: set if should raise if not exists.
+            properties: Mapping of property names to string values.
+            raise_if_not_exists: Raise if a property name is not recognized.
+                Set to False to allow custom properties.
             commit_properties: properties of the transaction commit. If None, default values are used.
             post_commithook_properties: properties for the post commit hook. If None, default values are used.
 
