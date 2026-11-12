@@ -8,7 +8,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use delta_kernel::{
     engine::arrow_conversion::TryIntoKernel as _,
     expressions::{Scalar, StructData},
-    schema::StructField,
 };
 use percent_encoding_rfc3986::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::Value;
@@ -262,22 +261,18 @@ impl ScalarExt for Scalar {
                 .downcast_ref::<TimestampNanosecondArray>()
                 .map(|v| checked(v, index, Self::TimestampNanosNtz(v.value(index)))),
             Struct(fields) => {
-                let struct_fields = fields
-                    .iter()
-                    .flat_map(|f| f.as_ref().try_into_kernel())
-                    .collect::<Vec<_>>();
                 let struct_arr = arr.as_struct();
                 if !struct_arr.is_valid(index) {
                     return None;
                 }
-                let values = struct_fields
-                    .iter()
-                    .map(|f: &StructField| {
-                        struct_arr
-                            .column_by_name(f.name())
-                            .and_then(|c| Self::from_array(c.as_ref(), index))
-                    })
-                    .collect::<Option<Vec<_>>>()?;
+                let mut struct_fields = Vec::with_capacity(fields.len());
+                let mut values = Vec::with_capacity(fields.len());
+                for (field, column) in fields.iter().zip(struct_arr.columns()) {
+                    if let Ok(field) = field.as_ref().try_into_kernel() {
+                        struct_fields.push(field);
+                        values.push(Self::from_array(column.as_ref(), index)?);
+                    }
+                }
                 Some(Self::Struct(
                     StructData::try_new(struct_fields, values).ok()?,
                 ))
@@ -957,6 +952,39 @@ mod tests {
             }
             _ => panic!("Expected struct scalar"),
         }
+    }
+
+    #[test]
+    fn test_scalar_from_array_struct_skips_unsupported_fields() {
+        use arrow_schema::{DataType, Field, TimeUnit};
+        use std::sync::Arc;
+
+        // Duration has no Delta type, so the middle field is left out.
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("first", DataType::Int64, false)),
+                Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new(
+                    "unsupported",
+                    DataType::Duration(TimeUnit::Millisecond),
+                    false,
+                )),
+                Arc::new(DurationMillisecondArray::from(vec![2])) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new("last", DataType::Int64, false)),
+                Arc::new(Int64Array::from(vec![3])) as Arc<dyn Array>,
+            ),
+        ]);
+
+        let Some(Scalar::Struct(struct_data)) = Scalar::from_array(&struct_array, 0) else {
+            panic!("Expected struct scalar");
+        };
+        let names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(names, ["first", "last"]);
+        assert_eq!(struct_data.values(), &[Scalar::Long(1), Scalar::Long(3)]);
     }
 
     #[test]
