@@ -212,6 +212,11 @@ fn stats_from_metadata(
             continue;
         }
 
+        // Repeated leaf null counts describe nested values only.
+        if column_descr.max_rep_level() > 0 {
+            continue;
+        }
+
         let maybe_stats: Option<AggregatedStats> = row_group_metadata
             .iter()
             .flat_map(|g| {
@@ -618,11 +623,6 @@ fn apply_min_max_for_column(
     max_values: &mut HashMap<String, ColumnValueStat>,
     null_counts: &mut HashMap<String, ColumnCountStat>,
 ) -> Result<(), DeltaWriterError> {
-    // Repeated leaf null counts describe nested values only.
-    if column_descr.max_rep_level() > 0 {
-        return Ok(());
-    }
-
     match (column_path_parts.len(), column_path_parts.first()) {
         // Base case - we are at the leaf struct level in the path
         (1, _) => {
