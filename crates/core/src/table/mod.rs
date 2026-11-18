@@ -17,6 +17,7 @@ use url::Url;
 
 use self::state::DeltaTableState;
 use crate::kernel::{CommitInfo, DataCheck, LogicalFileView, Snapshot, Version};
+use crate::logstore::default_logstore::DefaultLogStore;
 use crate::logstore::{LogStoreConfig, LogStoreRef, ObjectStoreRef};
 use crate::partitions::FilterLiteral;
 use crate::{DeltaResult, DeltaTableBuilder, DeltaTableError};
@@ -343,6 +344,9 @@ impl DeltaTable {
 
     /// Returns a URIs for all active files present in the current table version.
     pub fn get_file_uris(&self) -> DeltaResult<impl Iterator<Item = String> + '_> {
+        let local_root_prefix = (self.log_store.root_url().scheme() == "file"
+            && self.log_store.as_ref().any_ref().is::<DefaultLogStore>())
+        .then(|| self.log_store.to_uri(&Path::default()));
         Ok(self
             .state
             .as_ref()
@@ -350,7 +354,10 @@ impl DeltaTable {
             .log_data()
             .into_iter()
             .map(|add| add.object_store_path())
-            .map(|path| self.log_store.to_uri(&path)))
+            .map(move |path| match &local_root_prefix {
+                Some(prefix) => format!("{prefix}{path}"),
+                None => self.log_store.to_uri(&path),
+            }))
     }
 
     /// Returns the currently loaded state snapshot.
