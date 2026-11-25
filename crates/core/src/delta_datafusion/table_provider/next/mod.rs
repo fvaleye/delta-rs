@@ -370,46 +370,48 @@ fn validate_selected_file_url_under_table_root(
 ) -> crate::DeltaResult<String> {
     let mut original_root_identity = ensure_table_root_url(&normalize_table_url(table_root_url));
     strip_url_sensitive_parts(&mut original_root_identity);
-    let canonical_root_identity = canonical_table_root_identity(table_root_url);
-    let root_identities = if canonical_root_identity == original_root_identity {
-        vec![original_root_identity]
-    } else {
-        vec![original_root_identity, canonical_root_identity]
-    };
-
     let mut file_identity = file_url.clone();
     strip_url_sensitive_parts(&mut file_identity);
-    let mut file_identities = vec![file_identity.clone()];
-    if let Some(canonical_file_identity) = canonical_local_file_url(&file_identity)
-        && canonical_file_identity != file_identity
-    {
-        file_identities.push(canonical_file_identity);
-    }
 
-    let relative_path = file_identities
-        .iter()
-        .flat_map(|file_identity| {
-            root_identities
+    // Canonicalizing a local path costs filesystem calls, so try the path as written first.
+    let relative_path = match path_under_root(&file_identity, &original_root_identity) {
+        Some(relative_path) => relative_path.to_owned(),
+        None => {
+            let canonical_root_identity = canonical_table_root_identity(table_root_url);
+            let root_identities = if canonical_root_identity == original_root_identity {
+                vec![original_root_identity]
+            } else {
+                vec![original_root_identity, canonical_root_identity]
+            };
+
+            let mut file_identities = vec![file_identity.clone()];
+            if let Some(canonical_file_identity) = canonical_local_file_url(&file_identity)
+                && canonical_file_identity != file_identity
+            {
+                file_identities.push(canonical_file_identity);
+            }
+
+            file_identities
                 .iter()
-                .map(move |root_identity| (file_identity, root_identity))
-        })
-        .find_map(|(file_identity, root_identity)| {
-            let same_store = file_identity.scheme() == root_identity.scheme()
-                && file_identity.host_str() == root_identity.host_str()
-                && file_identity.port_or_known_default() == root_identity.port_or_known_default();
-            same_store
-                .then(|| file_identity.path().strip_prefix(root_identity.path()))
-                .flatten()
-        })
-        .ok_or_else(|| {
-            DeltaTableError::InvalidTableLocation(format!(
-                "{context} '{}' is outside table root '{}'",
-                redact_url_str_for_error(original),
-                redact_url_for_error(&canonical_table_root_identity(table_root_url))
-            ))
-        })?;
+                .flat_map(|file_identity| {
+                    root_identities
+                        .iter()
+                        .map(move |root_identity| (file_identity, root_identity))
+                })
+                .find_map(|(file_identity, root_identity)| {
+                    path_under_root(file_identity, root_identity).map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    DeltaTableError::InvalidTableLocation(format!(
+                        "{context} '{}' is outside table root '{}'",
+                        redact_url_str_for_error(original),
+                        redact_url_for_error(&canonical_table_root_identity(table_root_url))
+                    ))
+                })?
+        }
+    };
 
-    let mut normalized = table_root_url.join(relative_path).map_err(|err| {
+    let mut normalized = table_root_url.join(&relative_path).map_err(|err| {
         DeltaTableError::InvalidTableLocation(format!(
             "Failed to normalize {context} '{}' against '{}': {err}",
             redact_url_str_for_error(original),
@@ -421,6 +423,15 @@ fn validate_selected_file_url_under_table_root(
     normalized.set_query(None);
     normalized.set_fragment(None);
     Ok(normalized.to_string())
+}
+
+fn path_under_root<'a>(file_identity: &'a Url, root_identity: &Url) -> Option<&'a str> {
+    let same_store = file_identity.scheme() == root_identity.scheme()
+        && file_identity.host_str() == root_identity.host_str()
+        && file_identity.port_or_known_default() == root_identity.port_or_known_default();
+    same_store
+        .then(|| file_identity.path().strip_prefix(root_identity.path()))
+        .flatten()
 }
 
 pub(crate) fn normalize_path_as_file_id(
@@ -2682,6 +2693,24 @@ mod tests {
             assert_eq!(file_id, expected);
         }
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_normalize_path_as_file_id_accepts_symlink_spelled_file_urls() -> TestResult {
+        let tmp_dir = tempfile::tempdir()?;
+        let real_table = std::fs::canonicalize(tmp_dir.path())?.join("real");
+        std::fs::create_dir_all(&real_table)?;
+        std::fs::write(real_table.join("part-000.parquet"), b"")?;
+        let link_table = tmp_dir.path().join("link");
+        std::os::unix::fs::symlink(&real_table, &link_table)?;
+
+        let table_root = Url::from_directory_path(&real_table).unwrap();
+        let link_file = Url::from_file_path(link_table.join("part-000.parquet")).unwrap();
+        let file_id = normalize_path_as_file_id(link_file.as_str(), &table_root, "file path")?;
+
+        assert_eq!(file_id, table_root.join("part-000.parquet")?.to_string());
         Ok(())
     }
 
