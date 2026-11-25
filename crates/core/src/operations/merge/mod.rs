@@ -2016,15 +2016,14 @@ impl std::future::IntoFuture for MergeBuilder {
                     || {
                         let mut state = create_session().state();
                         // Default session only (no caller session), streamed merges only: keep the
-                        // source on the build side of the join. DataFusion 56 can make a small
-                        // target the build side, and then the target scan reads every file before
+                        // source on the build side of the join. DataFusion can swap the inputs to
+                        // build on the target, and then the target scan reads every file before
                         // the source's runtime predicates exist. This applies to every default
                         // streamed merge, not only those that skip files, because skip_files is
-                        // computed later in `execute`. Documented in the commit message.
+                        // computed later in `execute`. The setting is session-wide, so joins in
+                        // the source plan are not reordered either.
                         if this.streaming {
-                            let options = state.config_mut().options_mut();
-                            options.optimizer.hash_join_single_partition_threshold = 0;
-                            options.optimizer.hash_join_single_partition_threshold_rows = 0;
+                            state.config_mut().options_mut().optimizer.join_reordering = false;
                         }
                         state
                     },
@@ -2254,14 +2253,7 @@ mod tests {
     /// Keeps the source on the build side of the join, also for small test tables.
     fn source_build_side_session() -> Arc<dyn datafusion::catalog::Session> {
         let config = SessionConfig::new()
-            .set_usize(
-                "datafusion.optimizer.hash_join_single_partition_threshold",
-                0,
-            )
-            .set_usize(
-                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
-                0,
-            )
+            .set_bool("datafusion.optimizer.join_reordering", false)
             // Split the small test files into ranges, like large files in production.
             .with_repartition_file_min_size(0);
         Arc::new(SessionContext::new_with_config(config).state())
@@ -2548,7 +2540,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_streaming_source_target_on_build_side() {
-        // With a session that keeps DataFusion's default join thresholds, the small target is the
+        // With a session that keeps DataFusion's default join reordering, the small target is the
         // build side of the join. The target is read before the source statistics are known, so
         // no file is skipped. The default streamed-merge session forces the source as build side
         // (see `into_future`), so this case needs an explicit session.
@@ -2608,6 +2600,30 @@ mod tests {
 
         let actual = get_data(&table).await;
         assert_batches_sorted_eq!(&A_AND_X_UPSERTED, &actual);
+    }
+
+    #[tokio::test]
+    async fn test_merge_streaming_source_larger_than_target_keeps_source_on_build_side() {
+        // A `read_batch` source has statistics. When they are larger than the target's, the
+        // default session still keeps the source on the build side of the join, so the target
+        // scan skips the file that cannot match the source.
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(Some(vec!["modified"])).await;
+        let table = write_data(table, &schema).await;
+
+        let new_ids: Vec<String> = (0..1_000).map(|i| format!("N{i}")).collect();
+        let ids = std::iter::once("A")
+            .chain(new_ids.iter().map(String::as_str))
+            .collect();
+        let batch = source_batch(&schema, ids, vec![999; 1_001], vec!["2021-02-01"; 1_001]);
+        let source = SessionContext::new().read_batch(batch).unwrap();
+
+        let (_table, metrics) = upsert(table, source, id_and_modified_match(), None).await;
+
+        assert_eq!(metrics.num_target_rows_updated, 1);
+        assert_eq!(metrics.num_target_rows_inserted, 1_000);
+        assert_eq!(metrics.num_target_files_scanned, 1);
+        assert_eq!(metrics.num_target_files_skipped_during_scan, 1);
     }
 
     #[tokio::test]
