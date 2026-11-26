@@ -69,6 +69,7 @@ use std::sync::{Arc, OnceLock};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::runtime::SpawnedTask;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DFSchemaRef, Result as DataFusionResult, Statistics};
 use datafusion::execution::TaskContext;
@@ -229,11 +230,12 @@ impl fmt::Debug for SourceStatsCollector {
 pub(crate) struct SourceStats {
     pub input: LogicalPlan,
     pub collector: PtrEq<Arc<SourceStatsCollector>>,
+    pub hide_byte_size: bool,
 }
 
 impl PartialOrd for SourceStats {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self.collector != other.collector {
+        if self.collector != other.collector || self.hide_byte_size != other.hide_byte_size {
             return None;
         }
         self.input.partial_cmp(&other.input)
@@ -269,6 +271,7 @@ impl UserDefinedLogicalNodeCore for SourceStats {
         Ok(Self {
             input: inputs.swap_remove(0),
             collector: self.collector.clone(),
+            hide_byte_size: self.hide_byte_size,
         })
     }
 }
@@ -278,11 +281,22 @@ impl UserDefinedLogicalNodeCore for SourceStats {
 pub(crate) struct SourceStatsExec {
     input: Arc<dyn ExecutionPlan>,
     collector: Arc<SourceStatsCollector>,
+    /// Report no byte size, so DataFusion picks the join build side by row count. The target
+    /// reports its size on disk, which does not compare to the size of the source in memory.
+    hide_byte_size: bool,
 }
 
 impl SourceStatsExec {
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, collector: Arc<SourceStatsCollector>) -> Self {
-        Self { input, collector }
+    pub(crate) fn new(
+        input: Arc<dyn ExecutionPlan>,
+        collector: Arc<SourceStatsCollector>,
+        hide_byte_size: bool,
+    ) -> Self {
+        Self {
+            input,
+            collector,
+            hide_byte_size,
+        }
     }
 }
 
@@ -321,6 +335,7 @@ impl ExecutionPlan for SourceStatsExec {
         Ok(Arc::new(Self::new(
             children.swap_remove(0),
             Arc::clone(&self.collector),
+            self.hide_byte_size,
         )))
     }
 
@@ -365,11 +380,17 @@ impl ExecutionPlan for SourceStatsExec {
         input_stats: &[Arc<Statistics>],
         _args: &StatisticsArgs,
     ) -> DataFusionResult<Arc<Statistics>> {
-        input_stats.first().map(Arc::clone).ok_or_else(|| {
+        let statistics = input_stats.first().map(Arc::clone).ok_or_else(|| {
             datafusion::common::internal_datafusion_err!(
                 "SourceStatsExec expects statistics for exactly one child"
             )
-        })
+        })?;
+        if self.hide_byte_size {
+            let mut statistics = Arc::unwrap_or_clone(statistics);
+            statistics.total_byte_size = Precision::Absent;
+            return Ok(Arc::new(statistics));
+        }
+        Ok(statistics)
     }
 
     fn apply_expressions(

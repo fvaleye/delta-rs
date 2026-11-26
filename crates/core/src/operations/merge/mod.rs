@@ -710,6 +710,7 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
             return Ok(Some(Arc::new(SourceStatsExec::new(
                 Arc::clone(&physical_inputs[0]),
                 Arc::clone(&source_stats.collector),
+                source_stats.hide_byte_size,
             ))));
         }
 
@@ -850,6 +851,7 @@ async fn execute(
     log_store: LogStoreRef,
     snapshot: EagerSnapshot,
     state: SessionState,
+    use_default_session: bool,
     writer_properties: DeltaWriterProperties,
     mut commit_properties: CommitProperties,
     safe_cast: bool,
@@ -1073,6 +1075,13 @@ async fn execute(
             node: Arc::new(SourceStats {
                 input: source.clone(),
                 collector: Arc::clone(collector).into(),
+                // Caller sessions keep DataFusion's own join planning (see `into_future`). So
+                // does a target without row counts, which DataFusion could not compare.
+                hide_byte_size: use_default_session
+                    && snapshot
+                        .log_data()
+                        .iter()
+                        .all(|file| file.num_records().is_some()),
             }),
         }),
         None => source.clone(),
@@ -2045,6 +2054,7 @@ impl std::future::IntoFuture for MergeBuilder {
                     log_store,
                     snapshot,
                     state,
+                    this.state.is_none(),
                     this.writer_properties,
                     this.commit_properties,
                     this.safe_cast,
@@ -2608,6 +2618,28 @@ mod tests {
 
         let actual = get_data(&table).await;
         assert_batches_sorted_eq!(&A_AND_X_UPSERTED, &actual);
+    }
+
+    #[tokio::test]
+    async fn test_merge_streaming_source_with_fewer_rows_keeps_source_on_build_side() {
+        // One long id makes the two source rows larger in bytes than the four target rows. The
+        // default session compares row counts, so the source stays on the build side of the join
+        // and the target scan skips the file that cannot match it.
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(Some(vec!["modified"])).await;
+        let table = write_data(table, &schema).await;
+
+        let long_id = "N".repeat(100_000);
+        let ids = vec!["A", long_id.as_str()];
+        let batch = source_batch(&schema, ids, vec![999, 5], vec!["2021-02-01"; 2]);
+        let source = SessionContext::new().read_batch(batch).unwrap();
+
+        let (_table, metrics) = upsert(table, source, id_and_modified_match(), None).await;
+
+        assert_eq!(metrics.num_target_rows_updated, 1);
+        assert_eq!(metrics.num_target_rows_inserted, 1);
+        assert_eq!(metrics.num_target_files_scanned, 1);
+        assert_eq!(metrics.num_target_files_skipped_during_scan, 1);
     }
 
     #[tokio::test]
