@@ -4036,12 +4036,16 @@ def test_merge_file_pruning_regression_3636(tmp_path: pathlib.Path, streaming: b
 def test_merge_insert_predicate_skips_rejected_rows_4784(
     tmp_path: pathlib.Path, cdf: bool
 ):
-    # Regression test for https://github.com/delta-io/delta-rs/issues/4784
+    # Regression test for https://github.com/delta-io/delta-rs/issues/4784 and
+    # https://github.com/delta-io/delta-rs/issues/5097 (non-nullable id with CDF)
     import pyarrow as pa
 
+    schema = pa.schema(
+        [pa.field("id", pa.int64(), nullable=False), pa.field("v", pa.float64())]
+    )
     write_deltalake(
         tmp_path,
-        pa.table({"id": pa.array([1], pa.int64()), "v": pa.array([10.0])}),
+        pa.table({"id": [1], "v": [10.0]}, schema=schema),
         configuration={"delta.enableChangeDataFeed": "true"} if cdf else None,
     )
     # id 2 should be inserted; id 99 fails the insert predicate and must be ignored

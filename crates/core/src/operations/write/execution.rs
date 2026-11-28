@@ -848,7 +848,7 @@ async fn write_data_plan(
 ///   {"delete", "insert", "update_preimage", "update_postimage"}.
 ///
 /// As in SQL, a null `_change_type` matches neither filter, so the row is dropped from both
-/// sides. Merge relies on this to drop source rows that no insert clause accepts.
+/// sides.
 fn split_cdc_batch(batch: &RecordBatch) -> DeltaResult<(RecordBatch, RecordBatch)> {
     use arrow::array::BooleanArray;
     use arrow::array::cast::AsArray;

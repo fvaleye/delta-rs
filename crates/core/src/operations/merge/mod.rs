@@ -1624,6 +1624,8 @@ async fn execute(
                     .when(col(TARGET_UPDATE_COLUMN).is_null(), lit("update"))
                     .end()?,
             )?
+            // Rows no clause writes have no change type: drop them before validation.
+            .filter(col(CDC_COLUMN_NAME).is_not_null())?
             .drop_columns(&[file_column.as_str()])? // Avoid unnest schema errors.
             .with_column(
                 "__delta_rs_update_expanded",
@@ -8099,5 +8101,86 @@ mod tests {
 
         assert_batches_sorted_eq! {[
         "+----+-------+------------+--------------+-----------------+", "| id | value | modified   | _change_type | _commit_version |", "+----+-------+------------+--------------+-----------------+", "| D  | 100   | 2021-02-02 | delete       | 2               |", "| A  | 1     | 2021-02-01 | insert       | 1               |", "| B  | 10    | 2021-02-01 | insert       | 1               |", "| C  | 10    | 2021-02-02 | insert       | 1               |", "| D  | 100   | 2021-02-02 | insert       | 1               |", "+----+-------+------------+--------------+-----------------+", ], &batches }
+    }
+
+    #[tokio::test]
+    async fn test_merge_cdc_enabled_skips_source_rows_no_clause_writes() {
+        // https://github.com/delta-io/delta-rs/issues/5097
+        use crate::kernel::ProtocolInner;
+        use crate::operations::merge::Action;
+
+        let schema = get_delta_schema_non_null_id();
+
+        let actions = vec![Action::Protocol(ProtocolInner::new(1, 4).as_kernel())];
+        let table: DeltaTable = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(schema.fields().cloned())
+            .with_actions(actions)
+            .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
+            .await
+            .unwrap();
+
+        let schema = get_non_null_arrow_schema();
+        let table = write_data(table, &schema).await;
+
+        // `X` matches no target row and the insert clause rejects it, so no clause writes it.
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["X", "Y"])),
+                Arc::new(arrow::array::Int32Array::from(vec![None, Some(30)])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    None,
+                    Some("2023-07-04"),
+                ])),
+            ],
+        )
+        .unwrap();
+        let source = SessionContext::new().read_batch(batch).unwrap();
+
+        let (table, _metrics) = table
+            .merge(source, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_not_matched_insert(|insert| {
+                insert
+                    .predicate(col("source.value").is_not_null())
+                    .set("id", col("source.id"))
+                    .set("value", col("source.value"))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 1     | 2021-02-01 |",
+            "| B  | 10    | 2021-02-01 |",
+            "| C  | 10    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "| Y  | 30    | 2023-07-04 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+
+        let ctx = SessionContext::new();
+        let table = table
+            .scan_cdf()
+            .with_starting_version(0)
+            .build(&ctx.state(), None)
+            .await
+            .expect("Failed to load CDF");
+        let mut batches = collect(table, ctx.task_ctx())
+            .await
+            .expect("Failed to collect batches");
+        // The batches will contain a current _commit_timestamp which shouldn't be check_append_only
+        let _: Vec<_> = batches.iter_mut().map(|b| b.remove_column(5)).collect();
+
+        assert_batches_sorted_eq! {[
+        "+----+-------+------------+--------------+-----------------+", "| id | value | modified   | _change_type | _commit_version |", "+----+-------+------------+--------------+-----------------+", "| A  | 1     | 2021-02-01 | insert       | 1               |", "| B  | 10    | 2021-02-01 | insert       | 1               |", "| C  | 10    | 2021-02-02 | insert       | 1               |", "| D  | 100   | 2021-02-02 | insert       | 1               |", "| Y  | 30    | 2023-07-04 | insert       | 2               |", "+----+-------+------------+--------------+-----------------+", ], &batches }
     }
 }
