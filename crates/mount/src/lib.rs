@@ -50,6 +50,11 @@ impl ObjectStoreFactory for MountFactory {
                 .get(&crate::config::MountConfigKey::AllowUnsafeRename)
                 .unwrap_or(&String::new()),
         );
+        let fsync = str_is_truthy(
+            mount_config
+                .get(&crate::config::MountConfigKey::Fsync)
+                .unwrap_or(&String::new()),
+        );
 
         let (mut store, prefix) = match url.scheme() {
             "dbfs" => {
@@ -59,15 +64,16 @@ impl ObjectStoreFactory for MountFactory {
                 }
                 // We need to convert the dbfs url to a file url
                 Url::parse(&format!("file:///dbfs{}", url.path())).unwrap();
-                let store = Arc::new(file::MountFileStorageBackend::try_new()?) as ObjectStoreRef;
+                let store =
+                    Arc::new(file::MountFileStorageBackend::try_new(fsync)?) as ObjectStoreRef;
                 Ok((store, Path::from("/")))
             }
             "file" => {
                 let prefix = Path::from_filesystem_path(url.to_file_path().unwrap())?;
                 let store = if allow_unsafe_rename {
-                    Arc::new(file::MountFileStorageBackend::try_new()?) as ObjectStoreRef
+                    Arc::new(file::MountFileStorageBackend::try_new(fsync)?) as ObjectStoreRef
                 } else {
-                    Arc::new(LocalFileSystem::new()) as ObjectStoreRef
+                    Arc::new(LocalFileSystem::new().with_fsync(fsync)) as ObjectStoreRef
                 };
                 Ok((store, prefix))
             }
@@ -106,5 +112,52 @@ pub fn register_handlers(_additional_prefixes: Option<Url>) {
         let url = Url::parse(&format!("{scheme}://")).unwrap();
         object_store_factories().insert(url.clone(), factory.clone());
         logstore_factories().insert(url.clone(), factory.clone());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use object_store::ObjectStoreExt as _;
+
+    async fn put_file(url: &Url, options: &[(&str, &str)]) -> object_store::Result<()> {
+        let config = StorageConfig::parse_options(options.iter().copied()).unwrap();
+        let (store, prefix) = MountFactory {}.parse_url_opts(url, &config).unwrap();
+        store
+            .put(&prefix.join("file"), "data".into())
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn mount_fsync_syncs_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(dir.path()).unwrap();
+        // Writable but unreadable: files can be created, but the directory cannot be opened to fsync it.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+        let synced = put_file(&url, &[("mount_fsync", "true")]).await;
+        let unsafe_rename_synced = put_file(
+            &url,
+            &[("mount_fsync", "true"), ("allow_unsafe_rename", "true")],
+        )
+        .await;
+        let unsynced = put_file(&url, &[]).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            synced
+                .unwrap_err()
+                .to_string()
+                .contains("Permission denied")
+        );
+        assert!(
+            unsafe_rename_synced
+                .unwrap_err()
+                .to_string()
+                .contains("Permission denied")
+        );
+        unsynced.unwrap();
     }
 }

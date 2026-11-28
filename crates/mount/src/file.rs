@@ -71,9 +71,9 @@ pub struct MountFileStorageBackend {
 
 impl MountFileStorageBackend {
     /// Creates a new MountFileStorageBackend.
-    pub fn try_new() -> ObjectStoreResult<Self> {
+    pub fn try_new(fsync: bool) -> ObjectStoreResult<Self> {
         Ok(Self {
-            inner: Arc::new(LocalFileSystem::new()),
+            inner: Arc::new(LocalFileSystem::new().with_fsync(fsync)),
         })
     }
 }
@@ -260,7 +260,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let from = create_file(tmp_dir.path(), "from%20");
         let to = tmp_dir.path().join("to%2F");
-        let store = MountFileStorageBackend::try_new().unwrap();
+        let store = MountFileStorageBackend::try_new(false).unwrap();
 
         store
             .rename_opts(

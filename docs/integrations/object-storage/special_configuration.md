@@ -17,6 +17,7 @@ Delta-rs provides some additional values to be set in the storage_options for ad
 | backoff_config.max_backoff | The maximum backoff duration |
 | backoff_config.base | The multiplier to use for the next backoff duration |
 | MOUNT_ALLOW_UNSAFE_RENAME | If set it will allow unsafe renames on mounted storage |
+| MOUNT_FSYNC | If set to true, files written to local or mounted storage are synced to disk (on Unix, their directories too) before the write returns, so a returned commit is durable. Writes are slower |
 
 ## Common Client Options
 

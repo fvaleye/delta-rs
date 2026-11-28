@@ -11,12 +11,15 @@ pub enum MountConfigKey {
     /// If set to "true", allows creating commits without concurrent writer protection.
     /// Only safe if there is one writer to a given table.
     AllowUnsafeRename,
+    /// If set to "true", fsyncs written files and their parent directories before a write returns.
+    Fsync,
 }
 
 impl AsRef<str> for MountConfigKey {
     fn as_ref(&self) -> &str {
         match self {
             Self::AllowUnsafeRename => "mount_allow_unsafe_rename",
+            Self::Fsync => "mount_fsync",
         }
     }
 }
@@ -27,6 +30,7 @@ impl FromStr for MountConfigKey {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "mount_allow_unsafe_rename" | "allow_unsafe_rename" => Ok(Self::AllowUnsafeRename),
+            "mount_fsync" => Ok(Self::Fsync),
             _ => Err(Error::UnknownConfigKey(s.to_string())),
         }
     }
