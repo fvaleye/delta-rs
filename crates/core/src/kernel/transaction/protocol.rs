@@ -342,6 +342,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     #[cfg(feature = "datafusion")]
     {
         reader_features.insert(TableFeature::ColumnMapping);
+        reader_features.insert(TableFeature::TypeWidening);
+        reader_features.insert(TableFeature::TypeWideningPreview);
     }
 
     let mut writer_features = HashSet::new();

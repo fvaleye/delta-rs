@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::assert_batches_sorted_eq;
 use datafusion::common::Result as DFResult;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::planner::TypePlanner;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::ast::DataType as SqlDataType;
 use deltalake_core::delta_datafusion::create_session;
 use deltalake_test::acceptance::{
@@ -67,79 +69,6 @@ const KNOWN_FAILURES: KnownFailures = &[
         reason: "deltalake-core allows time travel to a timestamp before the first commit",
         workloads: &["time_travel_timestamps_read_ts_epoch"],
     },
-    KnownFailure {
-        cause: Cause::Core,
-        reason: "deltalake-core rejects the typeWidening reader feature; kernel reads these tables \
-         through the executor",
-        workloads: &[
-            "checkpoints_v2_with_type_widening_read_all",
-            "checkpoints_v2_with_type_widening_read_v0",
-            "merge_mergeSchemaEvoWidenType_readAll",
-            "merge_mergeSchemaEvoWidenType_readLargeAmount",
-            "type_widening_array_element_read_all",
-            "type_widening_byte_to_int_read_all",
-            "type_widening_byte_to_int_read_gt_max_byte",
-            "type_widening_byte_to_int_read_gt_max_short",
-            "type_widening_change_tracking_across_widening_read_all",
-            "type_widening_change_tracking_across_widening_read_original",
-            "type_widening_colmap_rename_filter_wide",
-            "type_widening_colmap_rename_project_renamed",
-            "type_widening_colmap_rename_read_all",
-            "type_widening_cross_physical_decimal_read_all",
-            "type_widening_cross_physical_decimal_read_v1_int32_only",
-            "type_widening_cross_physical_decimal_read_v3_through_int64",
-            "type_widening_date_to_timestamp_ntz_read_all",
-            "type_widening_date_to_timestamp_ntz_read_v1_before_widening",
-            "type_widening_decimal_precision_read_all",
-            "type_widening_decimal_precision_read_large_values",
-            "type_widening_float_to_double_read_all",
-            "type_widening_float_to_double_read_high_precision",
-            "type_widening_full_numeric_chain_read_all",
-            "type_widening_full_numeric_chain_read_v1_byte_only",
-            "type_widening_full_numeric_chain_read_v3_through_short",
-            "type_widening_full_numeric_chain_read_v5_through_int",
-            "type_widening_int_to_long_read_all",
-            "type_widening_int_to_long_read_gt_max_int",
-            "type_widening_int_to_long_read_v1_before_widening",
-            "type_widening_map_key_value_widening_read_all",
-            "type_widening_map_key_value_widening_read_v1_before_widening",
-            "type_widening_nested_field_read_all",
-            "type_widening_nested_field_read_large_count",
-            "type_widening_null_handling_read_all",
-            "type_widening_null_handling_read_non_null",
-            "type_widening_null_handling_read_nulls_only",
-            "type_widening_project_non_widened_project_non_widened",
-            "type_widening_project_non_widened_read_all",
-            "type_widening_project_widened_project_widened_only",
-            "type_widening_project_widened_project_widened_with_id",
-            "type_widening_project_widened_read_all",
-            "type_widening_row_tracking_combo_read_all",
-            "type_widening_row_tracking_combo_read_wide_values",
-            "type_widening_short_to_int_read_all",
-            "type_widening_short_to_int_read_gt_max_short",
-            "type_widening_short_to_long_read_all",
-            "type_widening_short_to_long_read_gt_max_int",
-            "type_widening_short_to_long_read_gt_max_short",
-            "type_widening_stats_after_change_predicate_cross_range",
-            "type_widening_stats_after_change_predicate_new_range",
-            "type_widening_stats_after_change_predicate_old_range",
-            "type_widening_stats_after_change_read_all",
-            "type_widening_with_column_mapping_filter_on_widened",
-            "type_widening_with_column_mapping_project_renamed_widened",
-            "type_widening_with_column_mapping_read_all",
-            "type_widening_with_data_skipping_read_all",
-            "type_widening_with_data_skipping_read_large_values_only",
-            "type_widening_with_data_skipping_read_with_predicate_on_widened",
-            "type_widening_with_dv_read_all",
-            "type_widening_with_dv_read_wide_values",
-            "type_widening_with_partition_read_all",
-            "type_widening_with_partition_read_partition_A",
-            "type_widening_with_partition_read_wide_values",
-            "write_features_type_widening_inserts_latest",
-            "write_features_type_widening_inserts_read_all",
-            "write_features_type_widening_inserts_read_ge_20",
-        ],
-    },
     // Some could be resolved using datafusion-spark extension planner
     KnownFailure {
         cause: Cause::DataFusionSql,
@@ -185,6 +114,48 @@ async fn scan_dat(
         return;
     };
     check_workload(&name, KNOWN_FAILURES, check(spec, table_root)).await;
+}
+
+/// `scan_dat` only counts rows, and no predicate workload reads these widened values, so compare
+/// every value with the workload's expected data.
+#[rstest]
+#[case::date_to_timestamp_ntz("type_widening_date_to_timestamp_ntz")]
+#[case::cross_physical_decimal("type_widening_cross_physical_decimal")]
+#[tokio::test]
+async fn read_widened_values(#[case] table: &str) -> DFResult<()> {
+    let spec_path = PathBuf::from(format!(
+        "../../dat/v0.0.8/{table}/specs/{table}_read_all.json"
+    ));
+    let Workload {
+        name,
+        spec,
+        table_root,
+    } = Workload::load(&spec_path);
+    let Spec::Read(spec) = spec else {
+        panic!("{name} is not a read workload");
+    };
+    let ctx = SessionContext::new();
+    let provider = load_table(&table_root, &spec.at)
+        .await?
+        .table_provider()
+        .await?;
+    ctx.register_table("t", provider)?;
+    let actual = ctx.sql("SELECT * FROM t").await?.collect().await?;
+
+    let expected_data = PathBuf::from(format!(
+        "../../dat/v0.0.8/{table}/expected/{name}/expected_data"
+    ));
+    let expected = ctx
+        .read_parquet(
+            expected_data.to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?
+        .collect()
+        .await?;
+    let expected = pretty_format_batches(&expected)?.to_string();
+    assert_batches_sorted_eq!(expected.lines().collect::<Vec<_>>(), &actual);
+    Ok(())
 }
 
 async fn check(spec: ReadSpec, table_root: Url) -> Result<(), String> {

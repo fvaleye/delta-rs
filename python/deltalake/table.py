@@ -1357,7 +1357,13 @@ class DeltaTable:
             if len(missing_features) > 0:
                 hint = (
                     _DATAFUSION_ENGINE_HINT
-                    if missing_features <= {"columnMapping", "deletionVectors"}
+                    if missing_features
+                    <= {
+                        "columnMapping",
+                        "deletionVectors",
+                        "typeWidening",
+                        "typeWidening-preview",
+                    }
                     else ""
                 )
                 raise DeltaProtocolError(

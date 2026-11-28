@@ -39,9 +39,9 @@ value: string
 `to_pyarrow_table` and `to_pandas` take an `engine` argument: `"pyarrow"`
 (the deprecated default) scans through a PyArrow dataset, `"datafusion"`
 reads with the built-in DataFusion engine. The datafusion engine also reads
-tables the pyarrow engine cannot (column mapping, deletion vectors), prunes
-files automatically from `filters`, and streams internally instead of
-materializing dataset fragments.
+tables the pyarrow engine cannot (column mapping, deletion vectors, type
+widening), prunes files automatically from `filters`, and streams internally
+instead of materializing dataset fragments.
 
 ``` python
 >>> dt.to_pandas(engine="datafusion", filters=[("year", "=", "2021")], columns=["value"])
@@ -138,8 +138,8 @@ returns an Arrow `RecordBatchReader`, so batches stream as they are produced
 and can be handed to any Arrow-native engine (PyArrow, DuckDB, Polars).
 Unlike `file_pruning_predicate`, its `predicate` filters rows: the result
 contains exactly the matching rows. It also reads tables that
-`to_pyarrow_dataset` cannot, such as those using column mapping or deletion
-vectors.
+`to_pyarrow_dataset` cannot, such as those using column mapping, deletion
+vectors or type widening.
 
 ``` python
 >>> reader = dt.scan(columns=["value"], predicate="year = '2021'")
