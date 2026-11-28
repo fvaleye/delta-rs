@@ -33,7 +33,7 @@ use datafusion::catalog::Session;
 use datafusion::common::Result as DFResult;
 use datafusion::common::{
     DFSchema, DataFusionError, Result, ScalarValue, TableReference, ToDFSchema,
-    config::ConfigOptions, unqualified_field_not_found,
+    config::ConfigOptions, plan_err, unqualified_field_not_found,
 };
 use datafusion::execution::context::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -235,8 +235,8 @@ impl<'a> DeltaContextProvider<'a> {
 }
 
 impl ContextProvider for DeltaContextProvider<'_> {
-    fn get_table_source(&self, _name: TableReference) -> DFResult<Arc<dyn TableSource>> {
-        unimplemented!()
+    fn get_table_source(&self, name: TableReference) -> DFResult<Arc<dyn TableSource>> {
+        plan_err!("table '{name}' not found")
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -260,7 +260,7 @@ impl ContextProvider for DeltaContextProvider<'_> {
     }
 
     fn get_variable_type(&self, _var: &[String]) -> Option<DataType> {
-        unimplemented!()
+        None
     }
 
     fn options(&self) -> &ConfigOptions {
@@ -1117,6 +1117,20 @@ mod test {
             .unwrap_err()
             .to_string();
         assert!(err.contains("No field named"), "unexpected error: {err}");
+    }
+
+    #[rstest]
+    #[case::variable("id = @var", "variable [\"@var\"] has no type information")]
+    #[case::subquery("id IN (SELECT id FROM other)", "table 'other' not found")]
+    fn parse_predicate_expression_rejects_variables_and_subqueries(
+        #[case] predicate: &str,
+        #[case] expected: &str,
+    ) {
+        let session = SessionContext::new();
+        let err = parse_predicate_expression(&column_name_schema(), predicate, &session.state())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "unexpected error: {err}");
     }
 
     #[test]
