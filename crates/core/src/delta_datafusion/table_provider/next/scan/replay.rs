@@ -36,7 +36,7 @@ use crate::{
     DeltaResult, DeltaTableError,
     delta_datafusion::{DeltaScanConfig, engine::to_datafusion_scalar},
     kernel::{
-        LogicalFileView, ReceiverStreamBuilder, Scan, StatsProjection, StructDataExt,
+        DataType, LogicalFileView, ReceiverStreamBuilder, Scan, StatsProjection, StructDataExt,
         parse_stats_column_with_schema,
     },
 };
@@ -296,6 +296,20 @@ fn extract_file_statistics(
                             extract_precision(&min_values, f.name()),
                             scan_config,
                         );
+                        let equal_bounds = matches!(
+                            (&min_value, &max_value),
+                            (Precision::Exact(min), Precision::Exact(max))
+                                if !min.is_null() && min == max
+                        );
+                        // Parquet leaves NaN out of float min/max, so equal bounds do not make
+                        // the column constant. DataFusion only folds it on an exact null count.
+                        let null_count = if equal_bounds
+                            && matches!(f.data_type(), &DataType::FLOAT | &DataType::DOUBLE)
+                        {
+                            null_count.to_inexact()
+                        } else {
+                            null_count
+                        };
 
                         ColumnStatistics {
                             null_count,

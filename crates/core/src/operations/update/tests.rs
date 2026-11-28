@@ -542,6 +542,45 @@ async fn test_update_null() {
 }
 
 #[tokio::test]
+async fn test_update_keeps_nan_in_file_with_equal_float_bounds() {
+    // Parquet leaves NaN out of float min/max, so this file records min = max = 9.0 (#5007).
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("f", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(arrow::array::Float64Array::from(vec![f64::NAN, 9.0])),
+        ],
+    )
+    .unwrap();
+    let table = DeltaTable::new_in_memory()
+        .write(vec![batch])
+        .await
+        .unwrap();
+
+    let (table, _metrics) = table
+        .update()
+        .with_predicate(col("f").lt(lit(10.0)))
+        .with_update("id", col("id"))
+        .await
+        .unwrap();
+
+    let expected = [
+        "+----+-----+",
+        "| id | f   |",
+        "+----+-----+",
+        "| 1  | NaN |",
+        "| 2  | 9.0 |",
+        "+----+-----+",
+    ];
+    let actual = get_data(&table).await;
+    assert_batches_sorted_eq!(&expected, &actual);
+}
+
+#[tokio::test]
 async fn test_no_update_operations() {
     // No Update operations are provided
     let table = prepare_values_table().await;
